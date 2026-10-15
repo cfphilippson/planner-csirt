@@ -116,7 +116,8 @@ Web App (HtmlService) com Google Sheets como datastore: quadro Kanban drag & dro
   - Motivo: gateways (Microsoft Safe Links, Gmail, Proofpoint) fazem *prefetch* de links — um GET que aprovasse direto seria aprovado pelo scanner.
   - Autorização: sessão Google do admin + papel `admin` na Equipe. Link aberto por não-admin → "Apenas administradores".
 - Decisão é única (o 2º admin recebe "já aprovada por X em Y"); aprovar cria/reativa o membro com o papel escolhido; solicitante recebe e-mail (com motivo na reprovação). Após reprovação há *cooldown* de 24h para nova solicitação; uma pendente por vez.
-- Painel **⚙ Admin** (badge com pendentes): Solicitações (aprovar/reprovar com motivo e papel), **Membros** (papel, ativar/desativar, adicionar direto — só e-mails do domínio). Travas: ninguém altera o próprio acesso; sempre ≥ 1 admin ativo.
+- Painel **⚙ Admin** (badge com pendentes): Solicitações (aprovar/reprovar com motivo e papel), **Membros** (papel, ativar/desativar, **remover**, adicionar direto — só e-mails do domínio). Travas: ninguém altera nem remove o próprio acesso; sempre ≥ 1 admin ativo.
+- **Desativar × Remover:** desativar bloqueia o acesso e mantém a pessoa na lista (reativável); remover apaga a linha da aba Equipe. Em ambos o histórico (atividades, comentários, checklist, auditoria) é preservado. Na remoção, as atividades **abertas** podem ser reatribuídas a outro membro (concluídas mantêm o responsável original); removido/desativado não recebe lembretes. Auditoria: `MEMBER_REMOVE`.
 - Aba `Solicitacoes` (`id | email | nome | justificativa | status | criadoEm | decididoPor | decididoEm | motivo`); Auditoria: `ACCESS_REQUEST/APPROVE/REJECT`, `MEMBER_ADD/UPDATE`.
 
 ## Importação do MS Planner

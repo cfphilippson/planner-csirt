@@ -293,4 +293,13 @@ dialog.adm{width:min(1000px,96vw)}
 .col-collapsed svg{width:15px;height:15px;flex:none;fill:none;stroke:var(--muted);stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
 .col-collapsed b{margin-left:auto;font-weight:600}
 .col-body.over .col-collapsed{border-color:var(--accent);border-style:dashed}
+/* ── Remoção de membro ── */
+.btn-rm{border:0;background:transparent;color:var(--muted);cursor:pointer;font-size:12px;font-weight:600;padding:4px 8px;border-radius:6px}
+.btn-rm:hover{color:var(--bad);background:color-mix(in srgb,var(--bad) 10%,transparent)}
+.rm-cell{text-align:right;width:1%}
+.tbl tr.rm-row td{border-bottom:1px solid var(--line);padding:4px 8px 10px}
+.rm-box{display:flex;flex-wrap:wrap;gap:10px 14px;align-items:center;padding:10px 12px;border:1px solid var(--bad);border-radius:10px;background:color-mix(in srgb,var(--bad) 7%,transparent)}
+.rm-box > div{display:flex;flex-direction:column;gap:2px;flex:1 1 260px}
+.rm-reassign{display:flex;align-items:center;gap:8px;font-size:13px}
+.rm-actions{margin-left:auto;display:flex;gap:8px}
 </style>

@@ -130,6 +130,7 @@ function setupUI() {
     $$('[data-close-adm]').forEach(x => x.addEventListener('click', () => $('#adm').close()));
     $('#pane-req').addEventListener('click', onRequestAction);
     $('#pane-mem').addEventListener('change', onMemberChange);
+    $('#pane-mem').addEventListener('click', onMemberClick);
     $('#impFile').addEventListener('change', e => { if (e.target.files[0]) parseFile(e.target.files[0]); });
     $('#impStage').addEventListener('change', onImportOptChange);
     $('#impStage').addEventListener('click', onImportClick);
@@ -809,13 +810,14 @@ function renderMembers(list) {
   const el = $('#pane-mem');
   list.sort((a, b) => (b.ativo - a.ativo) || a.nome.localeCompare(b.nome));
   el.innerHTML = `<h3>Equipe · ${list.filter(m => m.ativo).length} ativos</h3>
-    <table class="tbl"><thead><tr><th>Nome</th><th>E-mail</th><th>Papel</th><th>Ativo</th></tr></thead><tbody>${
-    list.map(m => `<tr class="${m.ativo ? '' : 'inactive'}" data-email="${esc(m.email)}">
+    <table class="tbl"><thead><tr><th>Nome</th><th>E-mail</th><th>Papel</th><th>Ativo</th><th></th></tr></thead><tbody>${
+    list.map(m => `<tr class="${m.ativo ? '' : 'inactive'}" data-email="${esc(m.email)}" data-nome="${esc(m.nome)}">
       <td>${esc(m.nome)}${m.eu ? ' <span class="pill">você</span>' : ''}</td><td>${esc(m.email)}</td>
       <td><select data-f="papel" ${m.eu ? 'disabled' : ''} aria-label="Papel">
         <option value="membro" ${m.papel !== 'admin' ? 'selected' : ''}>Membro</option>
         <option value="admin" ${m.papel === 'admin' ? 'selected' : ''}>Admin</option></select></td>
-      <td><input type="checkbox" data-f="ativo" ${m.ativo ? 'checked' : ''} ${m.eu ? 'disabled' : ''} aria-label="Ativo"></td></tr>`).join('')
+      <td><input type="checkbox" data-f="ativo" ${m.ativo ? 'checked' : ''} ${m.eu ? 'disabled' : ''} aria-label="Ativo"></td>
+      <td class="rm-cell">${m.eu ? '' : `<button type="button" class="btn-rm" data-act="rm" title="Remover da equipe" aria-label="Remover ${esc(m.nome)}">Remover</button>`}</td></tr>`).join('')
     }</tbody></table>
     <h3>Adicionar membro diretamente</h3>
     <form class="add-row" id="addMem" autocomplete="off">
@@ -824,7 +826,7 @@ function renderMembers(list) {
       <select name="papel"><option value="membro">Membro</option><option value="admin">Admin</option></select>
       <button class="btn primary">Adicionar</button>
     </form>
-    <p class="muted small">Desativar remove o acesso imediatamente (histórico e atividades permanecem). Você não pode alterar o próprio acesso e sempre precisa existir ao menos um admin ativo. Tudo é registrado na Auditoria.</p>`;
+    <p class="muted small"><b>Desativar</b> bloqueia o acesso e mantém a pessoa na lista (reativável). <b>Remover</b> tira a pessoa da equipe — atividades, comentários e auditoria continuam no histórico. Você não pode alterar o próprio acesso e sempre precisa existir ao menos um admin ativo. Tudo é registrado na Auditoria.</p>`;
   $('#addMem').addEventListener('submit', async e => {
     e.preventDefault();
     const f = e.target;
@@ -838,12 +840,51 @@ function renderMembers(list) {
 async function onMemberChange(e) {
   const inp = e.target.closest('[data-f]');
   const tr = e.target.closest('tr[data-email]');
-  if (!inp || !tr) return;
+  if (!inp || !tr || !['papel', 'ativo'].includes(inp.dataset.f)) return;
   const patch = inp.dataset.f === 'ativo' ? { ativo: inp.checked } : { papel: inp.value };
   if (patch.ativo === false && !confirm(`Desativar ${tr.dataset.email}? O acesso é removido imediatamente.`)) { inp.checked = true; return; }
   try { await call('apiUpdateMember', tr.dataset.email, patch); toast('Acesso atualizado'); refreshTeam(); }
   catch (err) { handleErr(err); }
   loadMembers();
+}
+
+/* Remoção de membro: confirmação inline com reatribuição opcional das atividades abertas */
+async function onMemberClick(e) {
+  const b = e.target.closest('button[data-act]');
+  if (!b || !b.closest('#pane-mem')) return;
+  const act = b.dataset.act;
+  if (act === 'rm') {
+    $$('#pane-mem tr.rm-row').forEach(x => x.remove());
+    const tr = b.closest('tr');
+    const email = tr.dataset.email, nome = tr.dataset.nome;
+    const open = S.tasks.filter(t => t.responsavel === email && t.status !== S.boot.done).length;
+    const others = S.boot.team.filter(m => m.email !== email);
+    tr.insertAdjacentHTML('afterend', `<tr class="rm-row" data-email="${esc(email)}" data-nome="${esc(nome)}"><td colspan="5">
+      <div class="rm-box">
+        <div><b>Remover ${esc(nome)} da equipe?</b>
+          <span class="muted small">O acesso é revogado e a pessoa sai da lista. Atividades, comentários e auditoria continuam no histórico.</span></div>
+        ${open ? `<label class="rm-reassign">${open} atividade(s) aberta(s) — reatribuir para
+            <select data-f="reassign"><option value="">— manter com ${esc(nome)} —</option>
+            ${others.map(m => `<option value="${esc(m.email)}">${esc(m.nome)}</option>`).join('')}</select></label>`
+          : '<span class="muted small">Nenhuma atividade aberta com essa pessoa.</span>'}
+        <span class="rm-actions">
+          <button type="button" class="btn sm" data-act="rm-cancel">Cancelar</button>
+          <button type="button" class="btn primary bad sm" data-act="rm-ok">Remover</button>
+        </span>
+      </div></td></tr>`);
+  } else if (act === 'rm-cancel') {
+    b.closest('tr').remove();
+  } else if (act === 'rm-ok') {
+    const tr = b.closest('tr');
+    const sel = tr.querySelector('[data-f=reassign]');
+    tr.querySelectorAll('button,select').forEach(x => { x.disabled = true; });
+    try {
+      const r = await call('apiRemoveMember', tr.dataset.email, sel ? sel.value : '');
+      toast(`${tr.dataset.nome} removido(a)${r.reatribuidas ? ` · ${r.reatribuidas} atividade(s) reatribuída(s)` : ''}`);
+      refreshTeam();
+    } catch (err) { handleErr(err); }
+    loadMembers();
+  }
 }
 
 /* ───────────── Admin: importação MS Planner ───────────── */

@@ -4,7 +4,7 @@
  *
  * Superfície exposta ao cliente (google.script.run): apiBootstrap, apiListTasks,
  * apiSaveTask, apiArchiveTask, apiRunRemindersNow, apiSetTheme,
- * apiListComments, apiAddComment, apiEditComment, apiDeleteComment,
+ * apiListComments, apiAddComment, apiEditComment, apiDeleteComment, apiRemoveMember,
  * apiListChecklist, apiAddChecklistItems, apiUpdateChecklistItem, apiDeleteChecklistItem, apiReorderChecklist.
  * Entradas de operação: setup() (editor), runReminders() (trigger diário).
  * Tudo com sufixo "_" é privado (não invocável via google.script.run).
@@ -687,7 +687,7 @@ function runReminders_() {
 
   Object.entries(byUser).forEach(([email, list]) => {
     const member = team.find(m => m.email === email);
-    if (member && !member.ativo) return;
+    if (!member || !member.ativo) return; // removido/desativado não recebe lembrete
     if (MailApp.getRemainingDailyQuota() < 1) { pulados += list.length; return; }
     list.sort((a, b) => a._sit.ord - b._sit.ord || (a.prazo || '9').localeCompare(b.prazo || '9'));
     const late = list.filter(t => t._sit.tipo === 'atrasada').length;
@@ -996,6 +996,47 @@ function apiUpdateMember(email, patch) {
     log_(user.email, 'MEMBER_UPDATE', email, `papel=${m.papel}→${papel} ativo=${m.ativo}→${ativo}`);
     _team = null;
     return { email, papel, ativo };
+  });
+}
+
+/**
+ * Remove o membro da aba Equipe (apaga a linha). Diferente de desativar: a pessoa some da lista.
+ * Histórico (atividades, comentários, checklist, auditoria) é preservado.
+ * reassignTo (opcional): reatribui as atividades ABERTAS do removido para outro membro ativo.
+ */
+function apiRemoveMember(email, reassignTo) {
+  const user = currentUser_();
+  assertAdmin_(user);
+  email = String(email || '').trim().toLowerCase();
+  reassignTo = String(reassignTo || '').trim().toLowerCase();
+  if (email === user.email) throw new Error('Você não pode remover a si mesmo (evita lockout). Peça a outro admin.');
+  return withLock_(() => {
+    _team = null;
+    const team = getTeam_();
+    const m = team.find(t => t.email === email);
+    if (!m) throw new Error('Membro não encontrado.');
+    if (!team.some(t => t.ativo && t.papel === 'admin' && t.email !== email)) {
+      throw new Error('Precisa existir ao menos um admin ativo.');
+    }
+    if (reassignTo && (reassignTo === email || !team.some(t => t.ativo && t.email === reassignTo))) {
+      throw new Error('Destino da reatribuição inválido ou inativo.');
+    }
+    let reatribuidas = 0;
+    if (reassignTo) {
+      const sh = sheet_(APP.SH_TASKS);
+      const now = new Date();
+      readTasks_().filter(t => t.responsavel === email && t.status !== APP.DONE).forEach(t => {
+        sh.getRange(t._row, C.responsavel + 1).setValue("'" + reassignTo);
+        sh.getRange(t._row, C.atualizadoEm + 1).setValue(now);
+        sh.getRange(t._row, C.versao + 1).setValue(t.versao + 1); // quem estiver com o form aberto recebe CONFLITO
+        reatribuidas++;
+      });
+    }
+    sheet_(APP.SH_TEAM).deleteRow(m._row);
+    _team = null;
+    log_(user.email, 'MEMBER_REMOVE', email,
+      `nome=${m.nome} papel=${m.papel} ativo=${m.ativo}` + (reassignTo ? ` reatribuidas=${reatribuidas}→${reassignTo}` : ' atividades mantidas'));
+    return { email, reatribuidas };
   });
 }
 
