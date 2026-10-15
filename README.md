@@ -1,5 +1,7 @@
 # Planner CSIRT
 
+![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg) ![Google Apps Script](https://img.shields.io/badge/Google%20Apps%20Script-V8-4285F4?logo=google&logoColor=white)
+
 **Kanban de atividades para times, rodando 100% no Google Workspace — sem licença extra.**
 
 O Google Workspace não tem um equivalente nativo ao MS Planner. Em vez de contratar mais uma ferramenta SaaS, este projeto entrega um planner completo com **Google Apps Script + Google Sheets**: quadro Kanban, lista de verificação, comentários com @menção, lembretes por e-mail, painel de métricas, gestão de acesso com aprovação por e-mail e importação do MS Planner.
@@ -141,7 +143,7 @@ Web App (HtmlService) com Google Sheets como datastore: quadro Kanban drag & dro
 
 ## Licença
 
-Defina a licença antes de reutilizar (ex.: MIT). Sem um arquivo `LICENSE`, todos os direitos ficam reservados ao autor.
+Distribuído sob a licença **MIT** — veja [`LICENSE`](LICENSE). Use, adapte e redistribua à vontade, mantendo o aviso de copyright.
 
 ---
 
