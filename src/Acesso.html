@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <?!= include('Styles'); ?>
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem('planner.theme');
+        if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+      } catch (e) {}
+    })();
+  </script>
+</head>
+<body class="access-body">
+  <main class="access-card">
+    <div class="brand access-brand">
+      <span class="brand-logo" role="img" aria-label="Logo"></span>
+      <span class="brand-sep" aria-hidden="true"></span>
+      <h1><?= appName ?></h1>
+    </div>
+    <div id="view"></div>
+  </main>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script>
+'use strict';
+const MODE = <?!= modeJson ?>;
+const DATA = <?!= dataJson ?>;
+
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const call = (fn, ...a) => new Promise((ok, ko) => google.script.run.withSuccessHandler(ok).withFailureHandler(ko)[fn](...a));
+const fmt = s => s ? `${s.slice(8, 10)}/${s.slice(5, 7)}/${s.slice(0, 4)} às ${s.slice(11, 16)}` : '—';
+const errMsg = e => String((e && e.message) || e).replace(/^(Exception|Error):\s*/, '');
+
+function toast(msg, kind = '') {
+  const el = $('#toast');
+  el.textContent = msg; el.className = 'toast show ' + kind;
+  clearTimeout(toast.t); toast.t = setTimeout(() => { el.className = 'toast'; }, 4500);
+}
+
+/* ───────── Solicitante ───────── */
+function renderRequester(st) {
+  const v = $('#view');
+  if (st.status === 'pendente') {
+    v.innerHTML = `<div class="access-state"><span class="state-icon pending">⏳</span>
+      <h2>Solicitação enviada</h2>
+      <p class="muted">Recebemos sua solicitação em ${esc(fmt(st.criadoEm))}. Os administradores foram avisados por e-mail;
+      você receberá a resposta em <b>${esc(st.email)}</b>.</p></div>`;
+    return;
+  }
+  const rejected = st.status === 'reprovado';
+  if (rejected && !st.podeSolicitar) {
+    v.innerHTML = `<div class="access-state"><span class="state-icon bad">✖</span>
+      <h2>Solicitação reprovada</h2>
+      ${st.motivo ? `<p class="reason"><b>Motivo:</b> ${esc(st.motivo)}</p>` : ''}
+      <p class="muted">Você poderá enviar uma nova solicitação a partir de ${esc(fmt(st.liberaEm))}.</p></div>`;
+    return;
+  }
+  v.innerHTML = `
+    <h2>Solicitar acesso</h2>
+    <p class="muted">Você está conectado como <b>${esc(st.email)}</b>, que ainda não tem acesso.
+      Os administradores receberão sua solicitação por e-mail.</p>
+    ${rejected ? `<p class="reason">Sua solicitação anterior foi reprovada${st.motivo ? `: ${esc(st.motivo)}` : '.'}</p>` : ''}
+    <form id="reqForm" class="access-form" autocomplete="off">
+      <label>Nome completo<input name="nome" required minlength="3" maxlength="120"></label>
+      <label>Justificativa
+        <textarea name="just" required minlength="10" maxlength="500"
+          placeholder="Ex.: analista do CSIRT, preciso acompanhar e atualizar as atividades do time."></textarea>
+      </label>
+      <button class="btn primary" id="btnReq">Enviar solicitação</button>
+    </form>`;
+  $('#reqForm').addEventListener('submit', async e => {
+    e.preventDefault();
+    const f = e.target, b = $('#btnReq');
+    b.disabled = true; b.textContent = 'Enviando…';
+    try {
+      renderRequester(await call('apiRequestAccess', f.nome.value, f.just.value));
+    } catch (err) {
+      toast(errMsg(err), 'err'); b.disabled = false; b.textContent = 'Enviar solicitação';
+    }
+  });
+}
+
+/* ───────── Admin: confirmação da decisão ───────── */
+function renderDecision(d) {
+  const v = $('#view');
+  const r = d.req;
+  if (!r) {
+    v.innerHTML = `<div class="access-state"><span class="state-icon bad">?</span><h2>Solicitação não encontrada</h2>
+      <p class="muted">O link pode estar incompleto. Confira no painel Admin do Planner.</p></div>`;
+    return;
+  }
+  const details = `<dl class="req-details">
+      <dt>Nome</dt><dd>${esc(r.nome)}</dd>
+      <dt>E-mail</dt><dd>${esc(r.email)}</dd>
+      <dt>Justificativa</dt><dd class="pre">${esc(r.justificativa)}</dd>
+      <dt>Solicitado em</dt><dd>${esc(fmt(r.criadoEm))}</dd>
+    </dl>`;
+  if (r.status !== 'pendente') {
+    const ok = r.status === 'aprovado';
+    v.innerHTML = `<div class="access-state"><span class="state-icon ${ok ? 'good' : 'bad'}">${ok ? '✔' : '✖'}</span>
+      <h2>Solicitação já ${r.status === 'aprovado' ? 'aprovada' : 'reprovada'}</h2>
+      <p class="muted">Decidida por <b>${esc(r.decididoPor)}</b> em ${esc(fmt(r.decididoEm))}.</p>
+      ${r.motivo ? `<p class="reason">${esc(r.motivo)}</p>` : ''}</div>${details}
+      ${d.url ? `<a class="btn" href="${esc(d.url)}">Abrir o Planner</a>` : ''}`;
+    return;
+  }
+  let decisao = d.decisao;
+  v.innerHTML = `<h2>Solicitação de acesso</h2>
+    <p class="muted">Confirme a decisão, ${esc(d.admin)}. O solicitante será avisado por e-mail.</p>
+    ${details}
+    <div class="seg" role="radiogroup" aria-label="Decisão">
+      <button type="button" data-d="aprovar" class="seg-ok">✔ Aprovar</button>
+      <button type="button" data-d="reprovar" class="seg-bad">✖ Reprovar</button>
+    </div>
+    <div class="access-form">
+      <label id="papelWrap">Papel
+        <select id="papel"><option value="membro">Membro</option><option value="admin">Admin</option></select>
+      </label>
+      <label><span id="motivoLbl">Observação (opcional)</span><textarea id="motivo" maxlength="500"></textarea></label>
+      <button class="btn primary" id="go"></button>
+    </div>`;
+  const paint = () => {
+    document.querySelectorAll('.seg button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.d === decisao)));
+    $('#papelWrap').classList.toggle('hidden', decisao !== 'aprovar');
+    $('#motivoLbl').textContent = decisao === 'aprovar' ? 'Observação (opcional)' : 'Motivo da reprovação (enviado ao solicitante)';
+    $('#go').textContent = decisao === 'aprovar' ? 'Confirmar aprovação' : 'Confirmar reprovação';
+    $('#go').className = 'btn primary ' + (decisao === 'aprovar' ? 'ok' : 'bad');
+  };
+  document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => { decisao = b.dataset.d; paint(); }));
+  paint();
+  $('#go').addEventListener('click', async () => {
+    const b = $('#go');
+    b.disabled = true;
+    try {
+      const res = await call('apiDecideAccess', r.id, decisao, $('#motivo').value, $('#papel').value);
+      renderDecision(Object.assign({}, d, { req: res }));
+      toast(res.status === 'aprovado' ? 'Acesso aprovado' : 'Solicitação reprovada');
+    } catch (err) {
+      toast(errMsg(err), 'err');
+      b.disabled = /já (aprovada|reprovada)/.test(errMsg(err)); // outro admin decidiu antes
+    }
+  });
+}
+
+if (MODE === 'decidir') renderDecision(DATA);
+else if (MODE === 'negado') {
+  $('#view').innerHTML = `<div class="access-state"><span class="state-icon bad">🔒</span><h2>Apenas administradores</h2>
+    <p class="muted">${esc(DATA.email)} não tem permissão para decidir solicitações de acesso.</p></div>`;
+} else renderRequester(DATA);
+</script>
+</body>
+</html>

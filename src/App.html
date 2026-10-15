@@ -1,0 +1,1336 @@
+<script>
+'use strict';
+/* Diagnóstico: qualquer erro de JS ou falha de carga aparece na tela (não fica preso em "carregando…") */
+function showFatal(title, detail, hints) {
+  const host = document.querySelector('main') || document.body;
+  const chip = document.getElementById('userChip');
+  if (chip) chip.textContent = 'erro';
+  host.innerHTML = `<div class="fatal">
+    <h2>${title}</h2>
+    <pre>${String(detail || '').replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))}</pre>
+    ${hints ? `<ul>${hints.map(h => `<li>${h}</li>`).join('')}</ul>` : ''}
+    <button class="btn primary" onclick="window.top.location.reload()">Tentar novamente</button>
+  </div>`;
+}
+window.addEventListener('error', e => (typeof S !== 'undefined' && S.boot)
+  ? (console.error(e.error || e.message), typeof toast === 'function' && toast('Erro inesperado: ' + e.message, 'err'))
+  : showFatal('Erro de JavaScript no portal', `${e.message}\n${e.filename || ''}:${e.lineno || ''}`,
+  ['Confirme que <b>App.html</b>, <b>Index.html</b> e <b>Styles.html</b> foram substituídos pela mesma versão.',
+   'Depois de salvar, publique uma <b>Nova versão</b> em Gerenciar implantações.']));
+window.addEventListener('unhandledrejection', e => console.warn('Promise rejeitada:', e.reason));
+const PRIO_RANK = { 'Crítica': 0, 'Alta': 1, 'Média': 2, 'Baixa': 3 };
+const STATUS_COLOR = { 'Backlog': '#94a3b8', 'A Fazer': '#60a5fa', 'Em Andamento': '#f59e0b', 'Bloqueado': '#ef4444', 'Concluído': '#22c55e' };
+const S = { boot: null, tasks: [], charts: {}, view: 'board', dragId: null, busy: false, tt: null,
+            cmtTask: null, comments: null, cmtBusy: false, drafts: {}, mention: null,
+            ckTask: null, ck: [], ckBusy: false, ckDrag: null };
+
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const call = (fn, ...a) => new Promise((ok, ko) => google.script.run.withSuccessHandler(ok).withFailureHandler(ko)[fn](...a));
+
+const ymd = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const todayStr = () => ymd(new Date());
+const utc = s => { const [y, m, d] = s.split('-').map(Number); return Date.UTC(y, m - 1, d); };
+const daysTo = day => day ? Math.round((utc(day) - utc(todayStr())) / 864e5) : null;
+const fmtBR = day => day ? day.split('-').reverse().slice(0, 2).join('/') : '';
+const fmtTs = iso => iso ? `${iso.slice(8, 10)}/${iso.slice(5, 7)}/${iso.slice(0, 4)} ${iso.slice(11, 16)}` : '—';
+
+const isDone = t => t.status === S.boot.done;
+const isLate = t => !isDone(t) && t.prazo && daysTo(t.prazo) < 0;
+const nameOf = email => (S.boot.team.find(m => m.email === email) || {}).nome || (email || '—').split('@')[0];
+const initials = n => n.split(/[\s._-]+/).filter(Boolean).slice(0, 2).map(p => p[0].toUpperCase()).join('');
+const level = p => p < 34 ? 'low' : p < 67 ? 'mid' : 'high';
+
+/* ───────────── tema (claro / escuro / sistema) ───────────── */
+const THEMES = ['light', 'system', 'dark'];
+const mqDark = window.matchMedia('(prefers-color-scheme: dark)');
+
+function storedTheme() {
+  try { const t = localStorage.getItem('planner.theme'); return THEMES.includes(t) ? t : 'system'; }
+  catch (e) { return 'system'; }
+}
+
+function applyTheme(t, { persist = true, animate = true } = {}) {
+  if (!THEMES.includes(t)) t = 'system';
+  const root = document.documentElement;
+  if (animate) { root.classList.add('theme-anim'); setTimeout(() => root.classList.remove('theme-anim'), 300); }
+  if (t === 'system') root.removeAttribute('data-theme'); else root.setAttribute('data-theme', t);
+  $$('[data-theme-opt]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.themeOpt === t)));
+  S.theme = t;
+  try { localStorage.setItem('planner.theme', t); } catch (e) { /* storage bloqueado: segue só com o servidor */ }
+  if (S.boot && S.view === 'dash') renderDash(filtered()); // Chart.js lê as cores das CSS vars
+  if (persist && S.boot) call('apiSetTheme', t).catch(e => console.warn('Tema não persistido no servidor:', e));
+}
+
+// Ativo antes do bootstrap: o seletor responde mesmo enquanto os dados carregam
+$$('[data-theme-opt]').forEach(b => b.addEventListener('click', () => applyTheme(b.dataset.themeOpt)));
+applyTheme(storedTheme(), { persist: false, animate: false });
+const onSchemeChange = () => { if (S.theme === 'system' && S.boot && S.view === 'dash') renderDash(filtered()); };
+if (mqDark.addEventListener) mqDark.addEventListener('change', onSchemeChange); else if (mqDark.addListener) mqDark.addListener(onSchemeChange);
+
+/* ───────────── bootstrap ───────────── */
+const BOOT_TIMEOUT_MS = 30000;
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, ko) => setTimeout(() => ko(new Error('TIMEOUT')), ms))]);
+
+async function init() {
+  const t0 = Date.now();
+  const slow = setTimeout(() => { const c = $('#userChip'); if (c && !S.boot) c.textContent = 'conectando ao servidor…'; }, 6000);
+  try {
+    S.boot = await withTimeout(call('apiBootstrap'), BOOT_TIMEOUT_MS);
+    clearTimeout(slow);
+    console.info(`[planner] bootstrap em ${Date.now() - t0} ms`);
+    S.tasks = S.boot.tasks;
+    // Preferência salva no servidor prevalece (sincroniza entre dispositivos)
+    if (S.boot.user.tema && S.boot.user.tema !== S.theme) applyTheme(S.boot.user.tema, { persist: false });
+    setupUI();
+    render();
+    setInterval(() => refresh(false), 60000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(false); });
+  } catch (e) {
+    clearTimeout(slow);
+    const msg = String((e && e.message) || e);
+    console.error('[planner] bootstrap falhou:', e);
+    if (msg === 'TIMEOUT') {
+      showFatal('O servidor não respondeu em 30 s', 'apiBootstrap sem resposta (nenhum sucesso nem erro retornado).', [
+        '<b>Mais de uma conta Google no navegador</b> (pessoal + corporativa) é a causa mais comum: o <code>google.script.run</code> não completa. Teste numa janela anônima só com a conta corporativa, ou em um perfil do Chrome dedicado.',
+        'No editor do Apps Script → <b>Execuções</b>: veja se há <code>apiBootstrap</code> com erro ou expirado.',
+        'No editor, rode <b>diagnostico()</b> e confira o Registro de execução — ele testa cada etapa da carga.'
+      ]);
+    } else {
+      showFatal('Falha ao carregar o Planner', msg, [
+        /PERMISSION|autoriza|authori/i.test(msg) ? 'Erro de permissão: saia das outras contas Google deste navegador ou use uma janela anônima.' : 'No editor, rode <b>diagnostico()</b> e confira o Registro de execução.',
+        'Se você atualizou o código, rode <b>setup()</b> uma vez e publique uma <b>Nova versão</b>.'
+      ]);
+    }
+  }
+}
+
+function fillSelect(sel, items, { keepFirst = true } = {}) {
+  const first = keepFirst ? sel.querySelector('option') : null;
+  sel.innerHTML = '';
+  if (first) sel.appendChild(first);
+  items.forEach(([v, l]) => sel.insertAdjacentHTML('beforeend', `<option value="${esc(v)}">${esc(l)}</option>`));
+}
+function ensureOption(sel, value, label) {
+  if (value && ![...sel.options].some(o => o.value === value)) {
+    sel.insertAdjacentHTML('beforeend', `<option value="${esc(value)}">${esc(label || value)}</option>`);
+  }
+}
+
+function setupUI() {
+  const b = S.boot;
+  $('#userChip').textContent = `${b.user.nome} · ${b.user.papel}`;
+  if (b.user.papel === 'admin') {
+    $('#btnReminders').classList.remove('hidden');
+    $('#btnAdmin').classList.remove('hidden');
+    setAdmBadge(b.pendingAccess || 0);
+    $('#btnAdmin').addEventListener('click', () => openAdmin(S.pending ? 'req' : 'mem'));
+    $$('.adm-tab').forEach(t => t.addEventListener('click', () => showPane(t.dataset.pane)));
+    $$('[data-close-adm]').forEach(x => x.addEventListener('click', () => $('#adm').close()));
+    $('#pane-req').addEventListener('click', onRequestAction);
+    $('#pane-mem').addEventListener('change', onMemberChange);
+    $('#impFile').addEventListener('change', e => { if (e.target.files[0]) parseFile(e.target.files[0]); });
+    $('#impStage').addEventListener('change', onImportOptChange);
+    $('#impStage').addEventListener('click', onImportClick);
+  }
+
+  fillTeam();
+  fillSelect($('#fCat'), b.categorias.map(c => [c, c]));
+  fillSelect($('#fPrio'), b.priorities.map(p => [p, p]));
+  fillSelect($('#frmCat'), [['', '—'], ...b.categorias.map(c => [c, c])], { keepFirst: false });
+  fillSelect($('#frmPrio'), b.priorities.map(p => [p, p]), { keepFirst: false });
+  fillSelect($('#frmStatus'), b.statuses.map(s => [s, s]), { keepFirst: false });
+
+  ['#fSearch', '#fResp', '#fCat', '#fPrio', '#fMine', '#fLate'].forEach(id =>
+    $(id).addEventListener(id === '#fSearch' ? 'input' : 'change', render));
+
+  $$('.tab').forEach(t => t.addEventListener('click', () => {
+    $$('.tab').forEach(x => x.classList.toggle('active', x === t));
+    S.view = t.dataset.view;
+    $('#board').classList.toggle('hidden', S.view !== 'board');
+    $('#dash').classList.toggle('hidden', S.view !== 'dash');
+    render();
+  }));
+
+  $('#btnNew').addEventListener('click', () => openTask(null));
+  $$('[data-close]').forEach(x => x.addEventListener('click', () => $('#dlg').close()));
+  $('#dlg').addEventListener('click', e => { if (e.target.id === 'dlg') $('#dlg').close(); });
+  $('#taskForm').addEventListener('submit', saveForm);
+  $('#btnArchive').addEventListener('click', archiveCurrent);
+  $('#btnReminders').addEventListener('click', runReminders);
+
+  // Comentários
+  const ta = $('#cmtText');
+  $('#btnComment').addEventListener('click', postComment);
+  ta.addEventListener('keydown', onComposerKey);
+  ta.addEventListener('input', () => { updateMentions(); if (S.cmtTask) S.drafts[S.cmtTask] = ta.value; });
+  ta.addEventListener('click', updateMentions);
+  ta.addEventListener('blur', () => setTimeout(hideMentions, 150));
+  $('#mentionMenu').addEventListener('mousedown', e => {
+    const o = e.target.closest('.mopt'); if (!o) return;
+    e.preventDefault(); pickMention(Number(o.dataset.i));
+  });
+  $('#cmtList').addEventListener('click', onCommentAction);
+
+  // Lista de verificação
+  $('#ckNew').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); addChecklistItem(); }  // Enter não submete o formulário
+  });
+  $('#ckList').addEventListener('click', onChecklistClick);
+  $('#ckList').addEventListener('keydown', onChecklistKey);
+  $('#ckList').addEventListener('dragstart', onCkDragStart);
+  $('#ckList').addEventListener('dragover', onCkDragOver);
+  $('#ckList').addEventListener('dragleave', e => { const li = e.target.closest('.ck-item'); if (li) li.classList.remove('drop-before', 'drop-after'); });
+  $('#ckList').addEventListener('drop', onCkDrop);
+  $('#ckList').addEventListener('dragend', () => { S.ckDrag = null; $$('.ck-item').forEach(x => x.classList.remove('dragging', 'drop-before', 'drop-after')); });
+  $('#dlg').addEventListener('close', () => { S.cmtTask = null; S.comments = null; hideMentions(); });
+  // Esc com menu de menção aberto fecha só o menu, não o modal
+  $('#dlg').addEventListener('cancel', e => {
+    if ($('.ck-text input')) { e.preventDefault(); renderChecklist(); }
+    else if (S.mention) { e.preventDefault(); hideMentions(); }
+    else if ($('.cmt-edit')) { e.preventDefault(); renderComments(false); }
+  });
+  // Polling da thread enquanto o modal está aberto
+  setInterval(() => {
+    if ($('#dlg').open && S.cmtTask && !document.hidden && !S.cmtBusy) loadComments(S.cmtTask, true);
+    if ($('#dlg').open && S.ckTask && !document.hidden && !S.ckBusy && !S.ckDrag && !$('.ck-text input')) loadChecklist(S.ckTask, true);
+  }, 20000);
+
+  // Drag & drop (delegado)
+  const board = $('#board');
+  board.addEventListener('dragstart', e => {
+    const c = e.target.closest('.card'); if (!c) return;
+    S.dragId = c.dataset.id; c.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', S.dragId);
+  });
+  board.addEventListener('dragend', e => {
+    e.target.closest('.card')?.classList.remove('dragging');
+    $$('.col-body.over').forEach(x => x.classList.remove('over'));
+    S.dragId = null;
+  });
+  board.addEventListener('dragover', e => {
+    const b = e.target.closest('.col-body'); if (!b || !S.dragId) return;
+    e.preventDefault(); b.classList.add('over');
+  });
+  board.addEventListener('dragleave', e => {
+    const b = e.target.closest('.col-body');
+    if (b && !b.contains(e.relatedTarget)) b.classList.remove('over');
+  });
+  board.addEventListener('drop', e => {
+    const b = e.target.closest('.col-body'); if (!b || !S.dragId) return;
+    e.preventDefault(); b.classList.remove('over');
+    moveTask(S.dragId, b.dataset.status);
+  });
+  board.addEventListener('click', e => {
+    const tg = e.target.closest('.col-toggle, .col-collapsed');
+    if (tg) return toggleColumn(tg.dataset.status || tg.dataset.toggle);
+    const c = e.target.closest('.card');
+    if (c) openTask(c.dataset.id);
+  });
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'n' && !$('#dlg').open && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) {
+      e.preventDefault(); openTask(null);
+    }
+  });
+}
+
+/* ───────────── render ───────────── */
+function filtered() {
+  const q = $('#fSearch').value.trim().toLowerCase();
+  const r = $('#fResp').value, c = $('#fCat').value, p = $('#fPrio').value;
+  const mine = $('#fMine').checked, late = $('#fLate').checked;
+  return S.tasks.filter(t =>
+    (!q || [t.id, t.titulo, t.tags, t.descricao].join(' ').toLowerCase().includes(q)) &&
+    (!r || t.responsavel === r) && (!c || t.categoria === c) && (!p || t.prioridade === p) &&
+    (!mine || t.responsavel === S.boot.user.email) && (!late || isLate(t)));
+}
+
+function render() {
+  const list = filtered();
+  renderProgress(list);
+  if (S.view === 'board') renderBoard(list); else renderDash(list);
+}
+
+function renderProgress(list) {
+  const total = list.length, done = list.filter(isDone).length;
+  const pct = total ? Math.round(done * 100 / total) : 0;
+  const bar = $('#progressBar');
+  bar.style.width = pct + '%';
+  bar.dataset.level = level(pct);
+  $('#progressLabel').textContent = `${pct}% · ${done} de ${total} concluídas`;
+
+  const open = list.filter(t => !isDone(t));
+  const k = [
+    ['Abertas', open.length, ''],
+    ['Em andamento', list.filter(t => t.status === 'Em Andamento').length, ''],
+    ['Bloqueadas', list.filter(t => t.status === S.boot.blocked).length, 'warn'],
+    ['Atrasadas', open.filter(isLate).length, 'bad'],
+    ['Vencem ≤ 7d', open.filter(t => { const d = daysTo(t.prazo); return d !== null && d >= 0 && d <= 7; }).length, ''],
+    ['Concluídas 30d', list.filter(t => isDone(t) && t.concluidoEm && daysTo(t.concluidoEm.slice(0, 10)) >= -30).length, 'good']
+  ];
+  $('#kpis').innerHTML = k.map(([l, v, c]) => `<div class="kpi ${c}"><span>${v}</span><small>${l}</small></div>`).join('');
+}
+
+function sortCards(a, b) {
+  if (isDone(a) && isDone(b)) return (b.concluidoEm || '').localeCompare(a.concluidoEm || '');
+  return (PRIO_RANK[a.prioridade] ?? 2) - (PRIO_RANK[b.prioridade] ?? 2) ||
+    (a.prazo || '9999').localeCompare(b.prazo || '9999');
+}
+
+/* Colunas recolhíveis (como "Tarefas concluídas" no MS Planner). Preferência por navegador;
+   padrão: Concluído recolhida. Coluna recolhida continua aceitando drop. */
+const COLLAPSE_KEY = 'planner.collapsed';
+function collapsedSet() {
+  if (S.collapsed) return S.collapsed;
+  let v = null;
+  try { v = JSON.parse(localStorage.getItem(COLLAPSE_KEY)); } catch (e) { /* storage bloqueado */ }
+  S.collapsed = new Set(Array.isArray(v) ? v : [S.boot.done]);
+  return S.collapsed;
+}
+function toggleColumn(st) {
+  const c = collapsedSet();
+  c.has(st) ? c.delete(st) : c.add(st);
+  try { localStorage.setItem(COLLAPSE_KEY, JSON.stringify([...c])); } catch (e) { /* ok: vale só nesta sessão */ }
+  render();
+  const btn = $(`.col-toggle[data-status="${CSS.escape(st)}"]`);
+  if (btn) btn.focus();
+}
+
+function renderBoard(list) {
+  const collapsed = collapsedSet();
+  $('#board').innerHTML = S.boot.statuses.map((st, i) => {
+    const items = list.filter(t => t.status === st).sort(sortCards);
+    const isCol = collapsed.has(st);
+    const label = st === S.boot.done ? 'Tarefas concluídas' : `${items.length === 1 ? 'tarefa oculta' : 'tarefas ocultas'}`;
+    const body = isCol
+      ? `<button type="button" class="col-collapsed" data-toggle="${esc(st)}" aria-label="Expandir ${esc(st)}">
+           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+           <span>${esc(st === S.boot.done ? label : `${items.length} ${label}`)}</span>
+           ${st === S.boot.done ? `<b>${items.length}</b>` : ''}
+         </button>`
+      : (items.map(cardHtml).join('') || '<div class="empty">Arraste atividades para cá</div>');
+    return `<section class="col${isCol ? ' collapsed' : ''}">
+      <header class="col-head">
+        <button type="button" class="col-toggle" data-status="${esc(st)}" aria-expanded="${!isCol}" aria-controls="colb-${i}"
+          title="${isCol ? 'Expandir' : 'Recolher'} ${esc(st)}">
+          <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+          <span class="dot" style="background:${STATUS_COLOR[st] || '#999'}"></span>${esc(st)}
+          <span class="count">${items.length}</span>
+        </button>
+      </header>
+      <div class="col-body" id="colb-${i}" data-status="${esc(st)}">${body}</div>
+    </section>`;
+  }).join('');
+}
+
+function cardHtml(t) {
+  const d = daysTo(t.prazo);
+  let due = '', cls = '';
+  if (isDone(t)) { due = t.concluidoEm ? `✓ ${fmtBR(t.concluidoEm.slice(0, 10))}` : '✓'; cls = 'ok'; }
+  else if (t.prazo) {
+    if (d < 0) { due = `Atrasada ${-d}d`; cls = 'late'; }
+    else if (d === 0) { due = 'Vence hoje'; cls = 'soon'; }
+    else if (d <= 3) { due = `Vence em ${d}d`; cls = 'soon'; }
+    else due = fmtBR(t.prazo);
+  }
+  const nm = nameOf(t.responsavel);
+  const rank = PRIO_RANK[t.prioridade] ?? 2;
+  const tags = (t.tags || '').split(',').map(s => s.trim()).filter(Boolean).slice(0, 3)
+    .map(x => `<span class="tag">#${esc(x)}</span>`).join('');
+  return `<article class="card" draggable="true" data-id="${esc(t.id)}" data-prio="${rank}">
+    <div class="card-top"><span class="badge prio-${rank}">${esc(t.prioridade)}</span><span class="cid">${esc(t.id)}</span></div>
+    <h4>${esc(t.titulo)}</h4>
+    ${t.categoria || tags ? `<div class="meta">${t.categoria ? `<span class="cat">${esc(t.categoria)}</span>` : ''}${tags}</div>` : ''}
+    <footer class="card-foot">
+      <span class="avatar" title="${esc(nm)} · ${esc(t.responsavel)}">${esc(initials(nm))}</span>
+      <span class="who">${esc(nm)}</span>
+      ${t.ckTotal ? `<span class="ck-badge${t.ckDone === t.ckTotal ? ' ok' : ''}" title="Lista de verificação: ${t.ckDone} de ${t.ckTotal}"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M8 12l3 3 5-6"/></svg>${t.ckDone}/${t.ckTotal}</span>` : ''}
+      ${t.nComentarios ? `<span class="cmt-count" title="${t.nComentarios} comentário(s)"><svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.4A8 8 0 1 1 21 12z"/></svg>${t.nComentarios}</span>` : ''}
+      ${due ? `<span class="due ${cls}">${esc(due)}</span>` : ''}
+    </footer>
+  </article>`;
+}
+
+/* ───────────── painel ───────────── */
+function draw(id, cfg) {
+  S.charts[id]?.destroy();
+  cfg.options = Object.assign({ responsive: true, maintainAspectRatio: false, animation: { duration: 250 } }, cfg.options);
+  S.charts[id] = new Chart(document.getElementById(id), cfg);
+}
+
+function lastWeeks(n) {
+  const out = [], base = new Date();
+  base.setDate(base.getDate() - ((base.getDay() + 6) % 7)); // segunda-feira
+  for (let i = n - 1; i >= 0; i--) {
+    const s = new Date(base); s.setDate(base.getDate() - 7 * i);
+    const e = new Date(s); e.setDate(s.getDate() + 6);
+    out.push({ start: ymd(s), end: ymd(e), label: fmtBR(ymd(s)) });
+  }
+  return out;
+}
+
+function renderDash(list) {
+  if (typeof Chart === 'undefined') {
+    $('#dash').innerHTML = '<p class="empty">Chart.js não carregou (CDN cdnjs bloqueado pela política de rede?).</p>';
+    return;
+  }
+  const css = getComputedStyle(document.documentElement);
+  Chart.defaults.color = css.getPropertyValue('--muted').trim();
+  Chart.defaults.borderColor = css.getPropertyValue('--line').trim();
+  Chart.defaults.font.family = css.getPropertyValue('--font').trim();
+
+  const st = S.boot.statuses;
+  draw('chStatus', {
+    type: 'doughnut',
+    data: { labels: st, datasets: [{ data: st.map(s => list.filter(t => t.status === s).length), backgroundColor: st.map(s => STATUS_COLOR[s]), borderWidth: 0 }] },
+    options: { cutout: '62%', plugins: { legend: { position: 'right' } } }
+  });
+
+  const people = [...new Set(list.map(t => t.responsavel))].sort((a, b) => nameOf(a).localeCompare(nameOf(b)));
+  draw('chResp', {
+    type: 'bar',
+    data: { labels: people.map(nameOf), datasets: st.map(s => ({ label: s, backgroundColor: STATUS_COLOR[s], data: people.map(p => list.filter(t => t.responsavel === p && t.status === s).length) })) },
+    options: { indexAxis: 'y', scales: { x: { stacked: true, ticks: { precision: 0 } }, y: { stacked: true } }, plugins: { legend: { position: 'bottom', labels: { boxWidth: 10 } } } }
+  });
+
+  const catOf = t => t.categoria || 'Sem categoria';
+  const cats = [...new Set(list.map(catOf))];
+  const pctCat = cats.map(c => { const g = list.filter(t => catOf(t) === c); return Math.round(g.filter(isDone).length * 100 / g.length); });
+  draw('chCat', {
+    type: 'bar',
+    data: { labels: cats, datasets: [{ label: '% concluído', data: pctCat, backgroundColor: pctCat.map(p => ({ low: '#f97316', mid: '#eab308', high: '#22c55e' }[level(p)])), borderRadius: 6 }] },
+    options: { scales: { y: { min: 0, max: 100, ticks: { callback: v => v + '%' } } }, plugins: { legend: { display: false } } }
+  });
+
+  const weeks = lastWeeks(8);
+  const bucket = iso => { if (!iso) return -1; const d = iso.slice(0, 10); return weeks.findIndex(w => d >= w.start && d <= w.end); };
+  const created = weeks.map(() => 0), closed = weeks.map(() => 0);
+  list.forEach(t => { const a = bucket(t.criadoEm); if (a >= 0) created[a]++; const b = bucket(t.concluidoEm); if (b >= 0) closed[b]++; });
+  draw('chFlow', {
+    type: 'line',
+    data: {
+      labels: weeks.map(w => 'sem ' + w.label),
+      datasets: [
+        { label: 'Criadas', data: created, borderColor: '#60a5fa', backgroundColor: '#60a5fa33', tension: .3, fill: true },
+        { label: 'Concluídas', data: closed, borderColor: '#22c55e', backgroundColor: '#22c55e33', tension: .3, fill: true }
+      ]
+    },
+    options: { scales: { y: { beginAtZero: true, ticks: { precision: 0 } } }, interaction: { mode: 'index', intersect: false } }
+  });
+
+  $('#respProgress').innerHTML = people.map(p => {
+    const g = list.filter(t => t.responsavel === p), d = g.filter(isDone).length;
+    const pc = Math.round(d * 100 / g.length), late = g.filter(isLate).length;
+    return `<div class="rp"><div class="rp-head"><span>${esc(nameOf(p))}</span>
+      <span>${pc}% · ${d}/${g.length}${late ? ` · <b class="late">${late} atrasada(s)</b>` : ''}</span></div>
+      <div class="progress sm"><div class="progress-bar" data-level="${level(pc)}" style="width:${pc}%"></div></div></div>`;
+  }).join('') || '<p class="empty">Sem dados</p>';
+}
+
+/* ───────────── ações ───────────── */
+function upsert(t) {
+  const i = S.tasks.findIndex(x => x.id === t.id);
+  if (t.nComentarios == null) t.nComentarios = i >= 0 ? (S.tasks[i].nComentarios || 0) : 0;
+  if (i >= 0) S.tasks[i] = t; else S.tasks.push(t);
+  render();
+}
+
+async function moveTask(id, status) {
+  const t = S.tasks.find(x => x.id === id);
+  if (!t || t.status === status) return;
+  const prev = { ...t };
+  Object.assign(t, { status, concluidoEm: status === S.boot.done ? todayStr() + 'T00:00:00' : '' });
+  render(); // otimista
+  try {
+    upsert(await call('apiSaveTask', { id, versao: prev.versao, status }));
+    toast(`${id} → ${status}${collapsedSet().has(status) ? ' (coluna recolhida — clique para ver)' : ''}`);
+  } catch (e) {
+    Object.assign(t, prev); render(); handleErr(e);
+  }
+}
+
+function openTask(id) {
+  const t = id ? S.tasks.find(x => x.id === id) : null;
+  const f = $('#taskForm');
+  f.reset();
+  const v = t || { status: 'A Fazer', prioridade: 'Média', responsavel: S.boot.user.email, categoria: '', lembreteDias: '' };
+  ensureOption($('#frmResp'), v.responsavel, nameOf(v.responsavel) + ' (inativo)');
+  ensureOption($('#frmCat'), v.categoria);
+  f.elements.taskId.value = t ? t.id : '';
+  f.elements.versao.value = t ? t.versao : '';
+  ['titulo', 'descricao', 'responsavel', 'categoria', 'prioridade', 'status', 'inicio', 'prazo', 'lembreteDias', 'tags']
+    .forEach(k => { f.elements[k].value = v[k] ?? ''; });
+  $('#dlgTitle').textContent = t ? `Editar ${t.id}` : 'Nova atividade';
+  $('#lembreteHint').textContent = `Vazio = padrão (${S.boot.lembreteDiasPadrao}d antes do prazo)`;
+  $('#btnArchive').classList.toggle('hidden', !t || !(S.boot.user.papel === 'admin' || t.criadoPor === S.boot.user.email));
+  $('#auditInfo').textContent = t ? `Criada por ${nameOf(t.criadoPor)} em ${fmtTs(t.criadoEm)} · atualizada ${fmtTs(t.atualizadoEm)} · v${t.versao}` : '';
+
+  // Comentários: só para atividades existentes
+  $('#dlg').classList.toggle('with-comments', !!t);
+  $('#cmtPanel').classList.toggle('hidden', !t);
+  S.cmtTask = t ? t.id : null;
+  S.comments = null;
+  hideMentions();
+  $('#cmtText').value = t ? (S.drafts[t.id] || '') : '';
+  if (t) { $('#cmtCount').textContent = t.nComentarios || 0; loadComments(t.id); }
+
+  // Lista de verificação: atividade existente carrega do servidor; nova usa rascunho local
+  S.ckTask = t ? t.id : null;
+  S.ck = t ? null : [];
+  $('#ckNew').value = '';
+  renderChecklist();
+  if (t) loadChecklist(t.id);
+
+  $('#dlg').showModal();
+  f.elements.titulo.focus();
+}
+
+/* ───────────── comentários ───────────── */
+function fmtRel(iso) {
+  if (!iso) return '';
+  const s = (Date.now() - new Date(iso)) / 1000;
+  if (s < 60) return 'agora';
+  if (s < 3600) return `há ${Math.floor(s / 60)} min`;
+  if (s < 86400) return `há ${Math.floor(s / 3600)} h`;
+  if (s < 7 * 86400) return `há ${Math.floor(s / 86400)} d`;
+  return fmtTs(iso);
+}
+
+const localPart = email => (email || '').split('@')[0];
+
+/** Escapa primeiro; só então aplica links (http/https apenas) e destaque de menções. */
+function richText(text) {
+  let h = esc(text);
+  h = h.replace(/\bhttps?:\/\/[^\s<]+[^\s<.,;:!?)\]]/g, u => `<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`);
+  h = h.replace(/(^|\s)@([\w.\-]+)/g, (all, sp, k) => {
+    const key = k.toLowerCase().replace(/[.\-]+$/, '');
+    const m = S.boot.team.find(x => localPart(x.email) === key);
+    return m ? `${sp}<span class="mention" title="${esc(m.nome)}">@${k}</span>` : all;
+  });
+  return h;
+}
+
+async function loadComments(taskId, silent) {
+  if (!silent) $('#cmtList').innerHTML = '<p class="empty">Carregando comentários…</p>';
+  try {
+    const list = await call('apiListComments', taskId);
+    if (S.cmtTask !== taskId) return;          // modal já trocou de atividade
+    if (silent && $('.cmt-edit')) return;      // não atropela edição inline
+    const changed = !S.comments || JSON.stringify(S.comments) !== JSON.stringify(list);
+    S.comments = list;
+    if (changed) renderComments(!silent);
+    syncCount(taskId);
+  } catch (e) {
+    if (!silent) $('#cmtList').innerHTML = `<p class="empty">Falha ao carregar: ${esc(e.message || e)}</p>`;
+  }
+}
+
+function syncCount(taskId) {
+  const n = (S.comments || []).length;
+  $('#cmtCount').textContent = n;
+  const t = S.tasks.find(x => x.id === taskId);
+  if (t && t.nComentarios !== n) { t.nComentarios = n; render(); }
+}
+
+function renderComments(scrollToEnd = true) {
+  const box = $('#cmtList');
+  const list = S.comments || [];
+  box.innerHTML = list.length ? list.map(c => {
+    const nm = nameOf(c.autor);
+    const mine = c.autor === S.boot.user.email;
+    return `<article class="cmt${mine ? ' mine' : ''}" data-id="${esc(c.id)}">
+      <span class="avatar" title="${esc(c.autor)}">${esc(initials(nm))}</span>
+      <div class="cmt-main">
+        <header>
+          <b>${esc(nm)}</b>
+          <time datetime="${esc(c.criadoEm)}" title="${esc(fmtTs(c.criadoEm))}">${esc(fmtRel(c.criadoEm))}</time>
+          ${c.editadoEm ? `<span class="edited" title="editado em ${esc(fmtTs(c.editadoEm))}">(editado)</span>` : ''}
+          <span class="cmt-actions">
+            ${c.podeEditar ? '<button type="button" data-act="edit">Editar</button>' : ''}
+            ${c.podeExcluir ? '<button type="button" data-act="del">Excluir</button>' : ''}
+          </span>
+        </header>
+        <div class="cmt-text">${richText(c.texto)}</div>
+      </div>
+    </article>`;
+  }).join('') : '<p class="empty">Nenhum comentário ainda.<br>Use <b>@</b> para mencionar alguém do time.</p>';
+  if (scrollToEnd) box.scrollTop = box.scrollHeight;
+}
+
+async function postComment() {
+  const ta = $('#cmtText');
+  const txt = ta.value.trim();
+  if (!txt || S.cmtBusy || !S.cmtTask) return;
+  const taskId = S.cmtTask;
+  S.cmtBusy = true; $('#btnComment').disabled = true;
+  try {
+    const c = await call('apiAddComment', taskId, txt);
+    if (S.cmtTask === taskId) {
+      S.comments = [...(S.comments || []), c];
+      ta.value = '';
+      delete S.drafts[taskId];
+      renderComments(true);
+      syncCount(taskId);
+    }
+    toast('Comentário publicado');
+  } catch (e) { handleErr(e); }
+  finally { S.cmtBusy = false; $('#btnComment').disabled = false; }
+}
+
+async function onCommentAction(e) {
+  const b = e.target.closest('button[data-act]');
+  if (!b) return;
+  const art = b.closest('.cmt');
+  const id = art.dataset.id;
+  const c = (S.comments || []).find(x => x.id === id);
+  if (!c) return;
+  const act = b.dataset.act;
+
+  if (act === 'del') {
+    if (!confirm('Excluir este comentário?')) return;
+    try {
+      await call('apiDeleteComment', id);
+      S.comments = S.comments.filter(x => x.id !== id);
+      renderComments(false); syncCount(S.cmtTask); toast('Comentário excluído');
+    } catch (err) { handleErr(err); }
+  } else if (act === 'edit') {
+    if ($('.cmt-edit')) renderComments(false); // uma edição por vez
+    const box = $(`.cmt[data-id="${CSS.escape(id)}"] .cmt-text`);
+    box.outerHTML = `<div class="cmt-edit"><textarea maxlength="5000">${esc(c.texto)}</textarea>
+      <div class="cmt-compose-foot"><button type="button" class="btn" data-act="cancel">Cancelar</button>
+      <button type="button" class="btn primary" data-act="save">Salvar</button></div></div>`;
+    const ta = $(`.cmt[data-id="${CSS.escape(id)}"] .cmt-edit textarea`);
+    ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length);
+  } else if (act === 'cancel') {
+    renderComments(false);
+  } else if (act === 'save') {
+    const txt = art.querySelector('.cmt-edit textarea').value.trim();
+    if (!txt) return;
+    b.disabled = true;
+    try {
+      const u = await call('apiEditComment', id, txt);
+      Object.assign(c, u); renderComments(false); toast('Comentário atualizado');
+    } catch (err) { handleErr(err); b.disabled = false; }
+  }
+}
+
+/* @menção: autocomplete sobre a aba Equipe */
+function mentionQuery(ta) {
+  const m = ta.value.slice(0, ta.selectionStart).match(/(^|\s)@([\w.\-]*)$/);
+  return m ? m[2].toLowerCase() : null;
+}
+function hideMentions() { $('#mentionMenu').classList.add('hidden'); S.mention = null; }
+function updateMentions() {
+  const q = mentionQuery($('#cmtText'));
+  if (q === null) return hideMentions();
+  const norm = s => s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+  const opts = S.boot.team.filter(m => localPart(m.email).includes(q) || norm(m.nome).includes(norm(q))).slice(0, 6);
+  if (!opts.length) return hideMentions();
+  S.mention = { opts, idx: 0 };
+  paintMentions();
+}
+function paintMentions() {
+  const { opts, idx } = S.mention;
+  const menu = $('#mentionMenu');
+  menu.innerHTML = opts.map((m, i) => `<button type="button" class="mopt${i === idx ? ' active' : ''}" data-i="${i}" role="option">
+      <span class="avatar">${esc(initials(m.nome))}</span><span>${esc(m.nome)}</span><small>@${esc(localPart(m.email))}</small></button>`).join('');
+  menu.classList.remove('hidden');
+}
+function pickMention(i) {
+  const ta = $('#cmtText'), m = S.mention.opts[i], pos = ta.selectionStart;
+  const before = ta.value.slice(0, pos).replace(/@([\w.\-]*)$/, '@' + localPart(m.email) + ' ');
+  ta.value = before + ta.value.slice(pos);
+  ta.setSelectionRange(before.length, before.length);
+  hideMentions(); ta.focus();
+}
+function onComposerKey(e) {
+  if (S.mention) {
+    const n = S.mention.opts.length;
+    if (e.key === 'ArrowDown') { e.preventDefault(); S.mention.idx = (S.mention.idx + 1) % n; return paintMentions(); }
+    if (e.key === 'ArrowUp') { e.preventDefault(); S.mention.idx = (S.mention.idx - 1 + n) % n; return paintMentions(); }
+    if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); return pickMention(S.mention.idx); }
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); return hideMentions(); }
+  }
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); postComment(); }
+}
+
+async function saveForm(e) {
+  e.preventDefault();
+  if (S.busy) return;
+  const fd = Object.fromEntries(new FormData(e.target));
+  const payload = { ...fd };
+  delete payload.taskId;
+  if (fd.taskId) { payload.id = fd.taskId; payload.versao = Number(fd.versao); } else delete payload.versao;
+  setBusy(true);
+  try {
+    const t = await call('apiSaveTask', payload);
+    if (!fd.taskId && S.ck && S.ck.length) {
+      try {
+        const items = await call('apiAddChecklistItems', t.id, S.ck.map(i => ({ texto: i.texto, feito: i.feito })));
+        t.ckTotal = items.length; t.ckDone = items.filter(i => i.feito).length;
+      } catch (err) { toast('Atividade criada, mas a lista falhou: ' + errText(err), 'err'); }
+    }
+    upsert(t);
+    $('#dlg').close();
+    toast(fd.taskId ? `${t.id} atualizada` : `${t.id} criada`);
+  } catch (err) { handleErr(err); }
+  finally { setBusy(false); }
+}
+
+async function archiveCurrent() {
+  const f = $('#taskForm');
+  const id = f.elements.taskId.value;
+  if (!id || !confirm(`Arquivar ${id}? Ela sai do quadro e das métricas (permanece na planilha).`)) return;
+  setBusy(true);
+  try {
+    await call('apiArchiveTask', id, Number(f.elements.versao.value));
+    S.tasks = S.tasks.filter(t => t.id !== id);
+    $('#dlg').close(); render(); toast(`${id} arquivada`);
+  } catch (err) { handleErr(err); }
+  finally { setBusy(false); }
+}
+
+async function runReminders() {
+  if (!confirm('Disparar o digest de lembretes agora? Itens já lembrados hoje são ignorados.')) return;
+  try {
+    const r = await call('apiRunRemindersNow');
+    toast(`${r.enviados} e-mail(s) · ${r.itens} item(ns) · quota restante ${r.quotaRestante}`);
+  } catch (e) { handleErr(e); }
+}
+
+async function refresh(force) {
+  if (!force && (S.dragId || $('#dlg').open || document.hidden || S.busy)) return;
+  try { S.tasks = await call('apiListTasks'); render(); } catch (e) { console.warn(e); }
+}
+
+function setBusy(b) { S.busy = b; $('#btnSave').disabled = b; $('#btnArchive').disabled = b; }
+
+function toast(msg, kind = '') {
+  const el = $('#toast');
+  el.textContent = msg;
+  el.className = 'toast show ' + kind;
+  clearTimeout(S.tt);
+  S.tt = setTimeout(() => { el.className = 'toast'; }, 4000);
+}
+
+function handleErr(e) {
+  const m = String((e && e.message) || e).replace(/^(Exception|Error):\s*/, '');
+  toast(m, 'err');
+  if (/CONFLITO/i.test(m)) { if ($('#dlg').open) $('#dlg').close(); refresh(true); }
+}
+/* ───────────── utilidades compartilhadas ───────────── */
+const errText = e => String((e && e.message) || e).replace(/^(Exception|Error):\s*/, '');
+
+function fillTeam() {
+  const team = S.boot.team.map(m => [m.email, m.nome]).sort((x, y) => x[1].localeCompare(y[1]));
+  const keepR = $('#fResp').value;
+  fillSelect($('#fResp'), team);
+  $('#fResp').value = keepR;
+  fillSelect($('#frmResp'), team, { keepFirst: false });
+}
+
+async function refreshTeam() {
+  try {
+    const b = await call('apiBootstrap');
+    S.boot.team = b.team; S.tasks = b.tasks;
+    fillTeam(); setAdmBadge(b.pendingAccess || 0); render();
+  } catch (e) { console.warn(e); }
+}
+
+/* ───────────── Admin: solicitações ───────────── */
+function setAdmBadge(n) {
+  S.pending = n;
+  ['#admBadge', '#admBadge2'].forEach(id => { const el = $(id); el.textContent = n; el.classList.toggle('hidden', !n); });
+}
+
+function openAdmin(pane) { $('#adm').showModal(); showPane(pane || 'req'); }
+
+function showPane(p) {
+  $$('.adm-tab').forEach(t => t.classList.toggle('active', t.dataset.pane === p));
+  $$('.adm-pane').forEach(x => x.classList.toggle('hidden', x.id !== 'pane-' + p));
+  if (p === 'req') loadRequests();
+  if (p === 'mem') loadMembers();
+}
+
+async function loadRequests() {
+  const el = $('#pane-req');
+  el.innerHTML = '<p class="empty">Carregando…</p>';
+  try {
+    const { pendentes, recentes } = await call('apiListAccessRequests');
+    setAdmBadge(pendentes.length);
+    el.innerHTML = `<h3>Pendentes (${pendentes.length})</h3>` +
+      (pendentes.length ? pendentes.map(r => `<article class="req-card" data-id="${esc(r.id)}">
+        <header><b>${esc(r.nome)}</b><span>${esc(r.email)}</span><small>${esc(fmtTs(r.criadoEm))} · ${esc(r.id)}</small></header>
+        <div class="pre">${esc(r.justificativa)}</div>
+        <div class="req-actions">
+          <select data-f="papel" aria-label="Papel"><option value="membro">Membro</option><option value="admin">Admin</option></select>
+          <input data-f="motivo" maxlength="500" placeholder="Observação / motivo (opcional, vai no e-mail)">
+          <button class="btn primary ok sm" data-act="aprovar">✔ Aprovar</button>
+          <button class="btn primary bad sm" data-act="reprovar">✖ Reprovar</button>
+        </div></article>`).join('') : '<p class="empty">Nenhuma solicitação pendente.</p>') +
+      '<h3>Decididas recentemente</h3>' +
+      (recentes.length ? `<table class="tbl"><thead><tr><th>Solicitante</th><th>Decisão</th><th>Por</th><th>Quando</th><th>Motivo</th></tr></thead><tbody>${
+        recentes.map(r => `<tr><td>${esc(r.nome)}<br><small class="muted">${esc(r.email)}</small></td>
+          <td><span class="pill ${r.status === 'aprovado' ? 'ok' : 'bad'}">${esc(r.status)}</span></td>
+          <td>${esc(nameOf(r.decididoPor))}</td><td>${esc(fmtTs(r.decididoEm))}</td><td>${esc(r.motivo)}</td></tr>`).join('')
+      }</tbody></table>` : '<p class="empty">—</p>');
+  } catch (e) { el.innerHTML = `<p class="imp-err">${esc(errText(e))}</p>`; }
+}
+
+async function onRequestAction(e) {
+  const b = e.target.closest('button[data-act]');
+  if (!b) return;
+  const card = b.closest('.req-card');
+  const act = b.dataset.act;
+  const motivo = card.querySelector('[data-f=motivo]').value;
+  const papel = card.querySelector('[data-f=papel]').value;
+  if (act === 'reprovar' && !confirm('Reprovar esta solicitação? O solicitante será avisado por e-mail.')) return;
+  if (act === 'aprovar' && papel === 'admin' && !confirm('Aprovar com papel ADMIN?')) return;
+  card.querySelectorAll('button,input,select').forEach(x => { x.disabled = true; });
+  try {
+    const r = await call('apiDecideAccess', card.dataset.id, act, motivo, papel);
+    toast(r.status === 'aprovado' ? `${r.nome}: acesso aprovado` : `${r.nome}: solicitação reprovada`);
+    if (r.status === 'aprovado') refreshTeam();
+  } catch (err) { handleErr(err); }
+  loadRequests();
+}
+
+/* ───────────── Admin: membros ───────────── */
+async function loadMembers() {
+  const el = $('#pane-mem');
+  el.innerHTML = '<p class="empty">Carregando…</p>';
+  try { renderMembers(await call('apiListMembers')); }
+  catch (e) { el.innerHTML = `<p class="imp-err">${esc(errText(e))}</p>`; }
+}
+
+function renderMembers(list) {
+  const el = $('#pane-mem');
+  list.sort((a, b) => (b.ativo - a.ativo) || a.nome.localeCompare(b.nome));
+  el.innerHTML = `<h3>Equipe · ${list.filter(m => m.ativo).length} ativos</h3>
+    <table class="tbl"><thead><tr><th>Nome</th><th>E-mail</th><th>Papel</th><th>Ativo</th></tr></thead><tbody>${
+    list.map(m => `<tr class="${m.ativo ? '' : 'inactive'}" data-email="${esc(m.email)}">
+      <td>${esc(m.nome)}${m.eu ? ' <span class="pill">você</span>' : ''}</td><td>${esc(m.email)}</td>
+      <td><select data-f="papel" ${m.eu ? 'disabled' : ''} aria-label="Papel">
+        <option value="membro" ${m.papel !== 'admin' ? 'selected' : ''}>Membro</option>
+        <option value="admin" ${m.papel === 'admin' ? 'selected' : ''}>Admin</option></select></td>
+      <td><input type="checkbox" data-f="ativo" ${m.ativo ? 'checked' : ''} ${m.eu ? 'disabled' : ''} aria-label="Ativo"></td></tr>`).join('')
+    }</tbody></table>
+    <h3>Adicionar membro diretamente</h3>
+    <form class="add-row" id="addMem" autocomplete="off">
+      <input name="nome" placeholder="Nome completo" required minlength="3">
+      <input name="email" type="email" placeholder="nome.sobrenome@empresa.com.br" required>
+      <select name="papel"><option value="membro">Membro</option><option value="admin">Admin</option></select>
+      <button class="btn primary">Adicionar</button>
+    </form>
+    <p class="muted small">Desativar remove o acesso imediatamente (histórico e atividades permanecem). Você não pode alterar o próprio acesso e sempre precisa existir ao menos um admin ativo. Tudo é registrado na Auditoria.</p>`;
+  $('#addMem').addEventListener('submit', async e => {
+    e.preventDefault();
+    const f = e.target;
+    try {
+      renderMembers(await call('apiAddMember', f.nome.value, f.email.value, f.papel.value));
+      toast('Membro adicionado'); refreshTeam();
+    } catch (err) { handleErr(err); }
+  });
+}
+
+async function onMemberChange(e) {
+  const inp = e.target.closest('[data-f]');
+  const tr = e.target.closest('tr[data-email]');
+  if (!inp || !tr) return;
+  const patch = inp.dataset.f === 'ativo' ? { ativo: inp.checked } : { papel: inp.value };
+  if (patch.ativo === false && !confirm(`Desativar ${tr.dataset.email}? O acesso é removido imediatamente.`)) { inp.checked = true; return; }
+  try { await call('apiUpdateMember', tr.dataset.email, patch); toast('Acesso atualizado'); refreshTeam(); }
+  catch (err) { handleErr(err); }
+  loadMembers();
+}
+
+/* ───────────── Admin: importação MS Planner ───────────── */
+const XLSX_SRC = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+const norm = v => String(v ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+
+// Cabeçalhos do "Exportar plano para o Excel" (pt-BR e en-US) + variações comuns
+const PCOLS = {
+  id: ['task id', 'id da tarefa', 'identificacao da tarefa', 'id'],
+  titulo: ['task name', 'nome da tarefa', 'tarefa', 'titulo', 'nome'],
+  bucket: ['bucket name', 'nome do bucket', 'bucket'],
+  progresso: ['progress', 'progresso', 'status', 'andamento'],
+  prioridade: ['priority', 'prioridade'],
+  atribuido: ['assigned to', 'atribuido a', 'atribuida a', 'atribuidos a', 'responsavel', 'responsaveis'],
+  criadoPor: ['created by', 'criado por', 'criada por'],
+  criadoEm: ['created date', 'data de criacao', 'criado em', 'criada em'],
+  inicio: ['start date', 'data de inicio', 'inicio'],
+  prazo: ['due date', 'data de conclusao', 'data de vencimento', 'vencimento', 'prazo', 'data limite', 'data de entrega'],
+  concluidoEm: ['completed date', 'concluido em', 'concluida em', 'data de conclusao real', 'data da conclusao'],
+  labels: ['labels', 'rotulos', 'etiquetas', 'categorias'],
+  descricao: ['description', 'descricao', 'notas', 'observacoes'],
+  ckDone: ['completed checklist items', 'itens concluidos da lista de verificacao', 'itens da lista de verificacao concluidos'],
+  ck: ['checklist items', 'itens da lista de verificacao']
+};
+const PCOL_LABEL = { id: 'ID', titulo: 'Título', bucket: 'Bucket', progresso: 'Progresso', prioridade: 'Prioridade',
+  atribuido: 'Atribuído a', criadoPor: 'Criado por', criadoEm: 'Criação', inicio: 'Início', prazo: 'Prazo',
+  concluidoEm: 'Concluído em', labels: 'Rótulos', descricao: 'Descrição', ckDone: 'Checklist', ck: 'Itens checklist' };
+
+const STATUS_ALIASES = {
+  'Backlog': ['backlog'],
+  'A Fazer': ['a fazer', 'to do', 'todo', 'pendente', 'nao iniciado', 'nao iniciada', 'not started', 'fazer'],
+  'Em Andamento': ['em andamento', 'in progress', 'doing', 'fazendo', 'andamento', 'em progresso'],
+  'Bloqueado': ['bloqueado', 'bloqueada', 'blocked', 'impedido', 'impedimento', 'aguardando'],
+  'Concluído': ['concluido', 'concluida', 'concluidos', 'concluidas', 'completed', 'done', 'feito', 'finalizado']
+};
+const statusAlias = v => { const n = norm(v); return Object.keys(STATUS_ALIASES).find(k => STATUS_ALIASES[k].includes(n)) || ''; };
+
+function prioFrom(v) {
+  const n = norm(v);
+  if (['urgent', 'urgente', 'critica', 'critical'].includes(n)) return 'Crítica';
+  if (['important', 'importante', 'alta', 'high'].includes(n)) return 'Alta';
+  if (['low', 'baixa'].includes(n)) return 'Baixa';
+  return 'Média';
+}
+
+function loadScript(src) {
+  return new Promise((ok, ko) => {
+    if (window.XLSX) return ok();
+    const s = document.createElement('script');
+    s.src = src; s.onload = ok;
+    s.onerror = () => ko(new Error('Não foi possível carregar o leitor de planilhas (CDN bloqueado?). Salve o export como CSV e tente de novo.'));
+    document.head.appendChild(s);
+  });
+}
+
+const pad2 = n => String(n).padStart(2, '0');
+function serialToISO(n) { // serial do Excel → data/hora "de parede" (sem drift de fuso)
+  const d = new Date(Math.round((n - 25569) * 864e5));
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}T${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:00`;
+}
+function toISO(v, dmy) {
+  if (v == null || v === '') return '';
+  if (typeof v === 'number' && v > 20000 && v < 80000) return serialToISO(v);
+  const s = String(v).trim();
+  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}T${m[4] || '00'}:${m[5] || '00'}:00`;
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:\s+(\d{1,2}):(\d{2}))?/);
+  if (m) {
+    let [, a, b, y, hh, mm] = m;
+    if (y.length === 2) y = '20' + y;
+    const [d, mo] = dmy ? [a, b] : [b, a];
+    if (+mo > 12 || +d > 31) return '';
+    return `${y}-${pad2(mo)}-${pad2(d)}T${pad2(hh || 0)}:${mm || '00'}:00`;
+  }
+  return '';
+}
+const toDay = (v, dmy) => toISO(v, dmy).slice(0, 10);
+
+function guessDmy(raw) {
+  let dmy = 0, mdy = 0;
+  raw.forEach(r => ['inicio', 'prazo', 'criadoEm', 'concluidoEm'].forEach(k => {
+    const m = String(r[k] ?? '').match(/^(\d{1,2})\/(\d{1,2})\//);
+    if (m) { if (+m[1] > 12) dmy++; if (+m[2] > 12) mdy++; }
+  }));
+  return mdy > dmy ? false : true; // padrão pt-BR
+}
+
+function hashStr(s) { let h = 5381; for (const c of s) h = ((h << 5) + h + c.charCodeAt(0)) >>> 0; return h.toString(16); }
+
+function autoMatch(name) {
+  const n = norm(name);
+  if (!n) return '';
+  const team = S.boot.team;
+  const exact = team.find(t => norm(t.nome) === n) ||
+    team.find(t => norm(localPart(t.email)).replace(/[._-]+/g, ' ') === n) ||
+    team.find(t => norm(t.email) === n);
+  if (exact) return exact.email;
+  const tk = n.split(' ');
+  const firstLast = team.filter(t => { const x = norm(t.nome).split(' '); return x[0] === tk[0] && x[x.length - 1] === tk[tk.length - 1]; });
+  if (firstLast.length === 1) return firstLast[0].email;
+  const first = team.filter(t => norm(t.nome).split(' ')[0] === tk[0]);
+  return first.length === 1 ? first[0].email : '';
+}
+
+async function parseFile(file) {
+  const stage = $('#impStage');
+  stage.classList.remove('hidden');
+  stage.innerHTML = '<p class="empty">Lendo arquivo…</p>';
+  try {
+    await loadScript(XLSX_SRC);
+    const wb = XLSX.read(await file.arrayBuffer(), { type: 'array', cellDates: false });
+    // Procura a aba/linha de cabeçalho (o export do Planner tem linhas de metadados antes da tabela)
+    let found = null;
+    for (const name of wb.SheetNames) {
+      const aoa = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, raw: true, defval: '' });
+      for (let i = 0; i < Math.min(aoa.length, 25); i++) {
+        const map = {};
+        aoa[i].forEach((h, c) => {
+          const k = Object.keys(PCOLS).find(key => PCOLS[key].includes(norm(h)));
+          if (k && map[k] == null) map[k] = c;
+        });
+        if (map.titulo != null && Object.keys(map).length >= 3) { found = { name, aoa, hdr: i, map }; break; }
+      }
+      if (found) break;
+    }
+    if (!found) throw new Error('Não encontrei a tabela do Planner (coluna "Nome da tarefa"/"Task Name"). Confira se é o export do Planner.');
+
+    const raw = [];
+    found.aoa.slice(found.hdr + 1).forEach((row, j) => {
+      const o = { _linha: found.hdr + j + 2 };
+      Object.entries(found.map).forEach(([k, c]) => { o[k] = row[c]; });
+      if (String(o.titulo ?? '').trim()) raw.push(o);
+    });
+    if (!raw.length) throw new Error('A planilha não tem atividades abaixo do cabeçalho.');
+
+    const names = {};
+    raw.forEach(r => {
+      String(r.atribuido ?? '').split(';').map(x => x.trim()).filter(Boolean).forEach(n => { names[n] = (names[n] || 0) + 1; });
+      const c = String(r.criadoPor ?? '').trim(); if (c && !names[c]) names[c] = 0;
+    });
+    const people = {};
+    Object.keys(names).forEach(n => { people[n] = autoMatch(n); });
+
+    S.imp = { file: file.name, sheet: found.name, map: found.map, raw, names, people,
+      dmy: guessDmy(raw), bucketMode: 'categoria', notStarted: 'A Fazer', fallback: S.boot.user.email, result: null };
+    renderImport();
+  } catch (e) {
+    stage.innerHTML = `<p class="imp-err">${esc(errText(e))}</p>`;
+  }
+}
+
+function checklistInfo(done, all) {
+  const d = String(done ?? '').trim();
+  if (/^\d+\s*\/\s*\d+$/.test(d)) return d.replace(/\s/g, '');
+  const total = String(all ?? '').split(';').map(x => x.trim()).filter(Boolean).length;
+  if (total) return `${/^\d+$/.test(d) ? d : '?'}/${total}`;
+  return '';
+}
+
+function buildRows() {
+  const I = S.imp;
+  return I.raw.map(r => {
+    const assignees = String(r.atribuido ?? '').split(';').map(x => x.trim()).filter(Boolean);
+    const resp = (assignees.length && I.people[assignees[0]]) || I.fallback;
+    const bucket = String(r.bucket ?? '').trim();
+    const bucketStatus = statusAlias(bucket);
+    const prog = statusAlias(r.progresso);
+    let status;
+    if (prog === 'Concluído') status = 'Concluído';         // concluída no Planner sempre vence
+    else if (bucketStatus) status = bucketStatus;            // Planner usado como Kanban (bucket = coluna)
+    else if (!prog || prog === 'A Fazer') status = I.notStarted; // "Não iniciado"
+    else status = prog;
+
+    const tags = String(r.labels ?? '').split(/[;,]/).map(x => x.trim()).filter(Boolean);
+    let categoria = '';
+    if (bucket && !bucketStatus) {
+      if (I.bucketMode === 'categoria') categoria = bucket;
+      else if (I.bucketMode === 'tag') tags.push(bucket);
+    }
+    let desc = String(r.descricao ?? '').trim();
+    const extra = assignees.slice(1).map(n => I.people[n] ? nameOf(I.people[n]) : n);
+    if (extra.length) desc += (desc ? '\n\n' : '') + 'Também atribuído a: ' + extra.join(', ');
+    if (assignees[0] && !I.people[assignees[0]]) desc += (desc ? '\n' : '') + `Atribuído no Planner a: ${assignees[0]}`;
+    // Itens da lista: o export traz os nomes (separados por ;) e só o total concluído (ex.: 1/3).
+    const ckNames = String(r.ck ?? '').split(';').map(x => x.trim()).filter(Boolean);
+    const ckm = String(r.ckDone ?? '').match(/^(\d+)\s*\/\s*(\d+)$/);
+    const ckDoneN = ckm ? +ckm[1] : 0;
+    const allDone = ckNames.length > 0 && ckDoneN >= ckNames.length;
+    const checklist = ckNames.map(texto => ({ texto: texto.slice(0, 300), feito: allDone }));
+    if (ckNames.length && ckDoneN > 0 && !allDone) {
+      desc += (desc ? '\n' : '') + `Checklist no Planner: ${ckDoneN}/${ckNames.length} concluídos — o export não informa quais; marque-os aqui.`;
+    } else if (!ckNames.length) {
+      const ck = checklistInfo(r.ckDone, r.ck);
+      if (ck) desc += (desc ? '\n' : '') + 'Checklist (Planner): ' + ck;
+    }
+
+    const origemId = 'planner:' + (String(r.id ?? '').trim() || hashStr(String(r.titulo) + '|' + String(r.criadoEm ?? '') + '|' + bucket));
+    return {
+      _linha: r._linha, origemId,
+      titulo: String(r.titulo).trim().slice(0, 200),
+      descricao: desc.slice(0, 5000),
+      responsavel: resp,
+      categoria: categoria.slice(0, 80),
+      prioridade: prioFrom(r.prioridade),
+      status,
+      inicio: toDay(r.inicio, I.dmy),
+      prazo: toDay(r.prazo, I.dmy),
+      tags: [...new Set(tags)].join(', ').slice(0, 300),
+      criadoPor: I.people[String(r.criadoPor ?? '').trim()] || '',
+      criadoEm: toISO(r.criadoEm, I.dmy),
+      concluidoEm: toISO(r.concluidoEm, I.dmy),
+      checklist
+    };
+  });
+}
+
+function renderImport() {
+  const I = S.imp;
+  const rows = buildRows();
+  const byStatus = S.boot.statuses.map(st => [st, rows.filter(r => r.status === st).length]);
+  const unmatched = Object.keys(I.names).filter(n => I.names[n] > 0 && !I.people[n]);
+  const teamOpts = sel => S.boot.team.map(m => `<option value="${esc(m.email)}" ${m.email === sel ? 'selected' : ''}>${esc(m.nome)}</option>`).join('');
+  const missing = ['prazo', 'progresso', 'atribuido'].filter(k => I.map[k] == null);
+
+  $('#impStage').innerHTML = `
+    <p><b>${esc(I.file)}</b> · aba “${esc(I.sheet)}” · <b>${rows.length}</b> atividades</p>
+    <p class="cols-found">Colunas reconhecidas: ${Object.keys(I.map).map(k => `<b>${esc(PCOL_LABEL[k])}</b>`).join(', ')}
+      ${missing.length ? `<br><span class="imp-err">Não encontradas: ${missing.map(k => PCOL_LABEL[k]).join(', ')}</span>` : ''}</p>
+    <div class="imp-summary">${byStatus.map(([s, n]) => `<div class="kpi"><span>${n}</span><small>${esc(s)}</small></div>`).join('')}</div>
+
+    <div class="imp-opts">
+      <label>Datas no arquivo <select data-opt="dmy"><option value="1" ${I.dmy ? 'selected' : ''}>dd/mm/aaaa</option><option value="0" ${!I.dmy ? 'selected' : ''}>mm/dd/aaaa</option></select></label>
+      <label>Bucket vira <select data-opt="bucketMode">
+        ${[['categoria', 'Categoria'], ['tag', 'Tag'], ['ignorar', 'Ignorar']].map(([v, l]) => `<option value="${v}" ${I.bucketMode === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+      <label>“Não iniciado” vira <select data-opt="notStarted">
+        ${['Backlog', 'A Fazer'].map(v => `<option ${I.notStarted === v ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+      <label>Sem responsável → <select data-opt="fallback">${teamOpts(I.fallback)}</select></label>
+    </div>
+    <p class="muted small">Buckets com nome de status (ex.: “Bloqueado”, “Em andamento”) viram o status da atividade. “Concluída” no Planner sempre vira Concluído.</p>
+
+    <h3>Pessoas do Planner → membros ${unmatched.length ? `<span class="pill warn">${unmatched.length} sem correspondência</span>` : '<span class="pill ok">todas mapeadas</span>'}</h3>
+    <table class="tbl"><thead><tr><th>Nome no Planner</th><th>Atividades</th><th>Membro no ${esc(document.title || 'Planner')}</th></tr></thead><tbody>${
+      Object.keys(I.names).sort((a, b) => I.names[b] - I.names[a]).map(n => `<tr>
+        <td>${esc(n)}</td><td>${I.names[n] || '—'}</td>
+        <td><select data-person="${esc(n)}"><option value="">— usar “sem responsável” —</option>${teamOpts(I.people[n])}</select></td></tr>`).join('')
+      || '<tr><td colspan="3" class="muted">Nenhuma pessoa atribuída no arquivo.</td></tr>'}</tbody></table>
+    ${unmatched.length ? '<p class="muted small">Quem não estiver na equipe: adicione em “Membros” (ou aprove a solicitação) e escolha o arquivo de novo — ou mantenha no responsável padrão; o nome original fica registrado na descrição.</p>' : ''}
+
+    <h3>Prévia (${Math.min(rows.length, 50)} de ${rows.length})</h3>
+    <div class="imp-preview"><table class="tbl"><thead><tr><th>Linha</th><th>Título</th><th>Responsável</th><th>Status</th><th>Prioridade</th><th>Prazo</th><th>Checklist</th><th>Categoria / Tags</th></tr></thead><tbody>${
+      rows.slice(0, 50).map(r => `<tr><td class="muted">${r._linha}</td><td>${esc(r.titulo)}</td><td>${esc(nameOf(r.responsavel))}</td>
+        <td>${esc(r.status)}</td><td>${esc(r.prioridade)}</td><td>${esc(fmtBR(r.prazo)) || '—'}${r.prazo ? '/' + r.prazo.slice(2, 4) : ''}</td>
+        <td>${r.checklist.length ? `${r.checklist.filter(x => x.feito).length}/${r.checklist.length}` : '—'}</td>
+        <td>${esc([r.categoria, r.tags].filter(Boolean).join(' · '))}</td></tr>`).join('')}</tbody></table></div>
+
+    <div class="imp-foot">
+      <button class="btn primary" id="impGo" ${I.result ? 'disabled' : ''}>Importar ${rows.length} atividades</button>
+      <button class="btn" data-imp="reset">Escolher outro arquivo</button>
+      <span id="impProg" class="muted small"></span>
+    </div>
+    <div id="impResult">${I.result ? resultHtml(I.result) : ''}</div>`;
+}
+
+function resultHtml(r) {
+  return `<h3>Resultado</h3>
+    <div class="imp-summary">
+      <div class="kpi good"><span>${r.inseridas}</span><small>inseridas</small></div>
+      <div class="kpi"><span>${r.duplicadas}</span><small>já existiam (ignoradas)</small></div>
+      <div class="kpi ${r.erros.length ? 'bad' : ''}"><span>${r.erros.length}</span><small>com erro</small></div>
+      <div class="kpi"><span>${r.itensChecklist || 0}</span><small>itens de checklist</small></div>
+    </div>
+    ${r.erros.length ? `<table class="tbl"><thead><tr><th>Linha</th><th>Título</th><th>Erro</th></tr></thead><tbody>${
+      r.erros.map(e => `<tr><td>${esc(e.linha)}</td><td>${esc(e.titulo || '')}</td><td class="imp-err">${esc(e.erro)}</td></tr>`).join('')}</tbody></table>` : ''}`;
+}
+
+function onImportOptChange(e) {
+  const t = e.target;
+  if (!S.imp) return;
+  if (t.dataset.opt === 'dmy') S.imp.dmy = t.value === '1';
+  else if (t.dataset.opt) S.imp[t.dataset.opt] = t.value;
+  else if (t.dataset.person != null) S.imp.people[t.dataset.person] = t.value;
+  else return;
+  S.imp.result = null;
+  renderImport();
+}
+
+async function onImportClick(e) {
+  if (e.target.closest('[data-imp="reset"]')) {
+    S.imp = null; $('#impFile').value = ''; $('#impStage').classList.add('hidden'); $('#impStage').innerHTML = '';
+    return;
+  }
+  if (!e.target.closest('#impGo')) return;
+  const rows = buildRows();
+  if (!rows.length || !confirm(`Importar ${rows.length} atividades para o Planner CSIRT?`)) return;
+  const btn = $('#impGo');
+  btn.disabled = true;
+  const tot = { inseridas: 0, duplicadas: 0, erros: [] };
+  const BATCH = 200;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    $('#impProg').textContent = `Gravando ${Math.min(i + BATCH, rows.length)} de ${rows.length}…`;
+    try {
+      const r = await call('apiImportTasks', rows.slice(i, i + BATCH));
+      tot.inseridas += r.inseridas; tot.duplicadas += r.duplicadas; tot.erros.push(...r.erros);
+      tot.itensChecklist = (tot.itensChecklist || 0) + (r.itensChecklist || 0);
+    } catch (err) {
+      tot.erros.push({ linha: `lote ${i / BATCH + 1}`, erro: errText(err) });
+    }
+  }
+  S.imp.result = tot;
+  $('#impProg').textContent = '';
+  $('#impResult').innerHTML = resultHtml(tot);
+  toast(`${tot.inseridas} atividades importadas`);
+  refresh(true);
+}
+
+
+/* ───────────── Lista de verificação ───────────── */
+// Atividade existente: cada ação grava na hora (otimista + rollback). Atividade nova: rascunho local,
+// enviado em lote logo após o "Salvar" criar a atividade.
+const CK_SVG = '<svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
+let ckTmp = 0;
+
+async function loadChecklist(taskId, silent) {
+  try {
+    const list = await call('apiListChecklist', taskId);
+    if (S.ckTask !== taskId) return;
+    if (silent && (S.ckBusy || S.ckDrag || $('.ck-text input'))) return;
+    if (silent && JSON.stringify(list) === JSON.stringify(S.ck)) return;
+    S.ck = list;
+    renderChecklist();
+    syncCkCount();
+  } catch (e) {
+    if (!silent) { S.ck = []; renderChecklist(); toast('Falha ao carregar a lista: ' + errText(e), 'err'); }
+  }
+}
+
+function renderChecklist() {
+  const list = S.ck;
+  const box = $('#ckList');
+  if (list === null) { box.innerHTML = '<li class="empty">Carregando…</li>'; $('#ckCount').textContent = ''; return; }
+  const done = list.filter(i => i.feito).length;
+  const pct = list.length ? Math.round(done * 100 / list.length) : 0;
+  $('#ckCount').textContent = list.length ? `${done}/${list.length}` : '';
+  $('#ckBarWrap').classList.toggle('hidden', !list.length);
+  $('#ckBar').style.width = pct + '%';
+  $('#ckBar').dataset.level = level(pct);
+  box.innerHTML = list.map(i => {
+    const who = i.feito && i.feitoPor ? `Concluído por ${nameOf(i.feitoPor)} em ${fmtTs(i.feitoEm)}` : 'Marcar como concluído';
+    return `<li class="ck-item${i.feito ? ' done' : ''}" data-id="${esc(i.id)}" draggable="true">
+      <span class="ck-grip" title="Arrastar para reordenar" aria-hidden="true">⋮⋮</span>
+      <button type="button" class="ck-check" role="checkbox" aria-checked="${i.feito}" title="${esc(who)}" aria-label="${esc(who)}">${CK_SVG}</button>
+      <span class="ck-text" tabindex="0" title="Clique para editar">${esc(i.texto)}</span>
+      <button type="button" class="ck-del" title="Remover item" aria-label="Remover item">✕</button>
+    </li>`;
+  }).join('');
+}
+
+function syncCkCount() {
+  if (!S.ckTask || !S.ck) return;
+  const t = S.tasks.find(x => x.id === S.ckTask);
+  if (!t) return;
+  const total = S.ck.length, done = S.ck.filter(i => i.feito).length;
+  if (t.ckTotal !== total || t.ckDone !== done) { t.ckTotal = total; t.ckDone = done; render(); }
+}
+
+/** Executa a ação otimista; em erro, restaura o estado anterior e avisa. */
+async function ckMutate(apply, remote) {
+  const snapshot = JSON.parse(JSON.stringify(S.ck));
+  apply();
+  renderChecklist();
+  if (!S.ckTask) return;                  // rascunho de atividade nova: só local
+  S.ckBusy = true;
+  try { await remote(); syncCkCount(); }
+  catch (e) {
+    S.ck = snapshot; renderChecklist(); handleErr(e);
+    if (/removido|não encontrado/i.test(errText(e))) loadChecklist(S.ckTask);
+  } finally { S.ckBusy = false; }
+}
+
+async function addChecklistItem() {
+  const inp = $('#ckNew');
+  const texto = inp.value.replace(/\s+/g, ' ').trim();
+  if (!texto || S.ck === null) return;
+  if (S.ck.length >= 50) { toast('Máximo de 50 itens por atividade.', 'err'); return; }
+  inp.value = '';
+  inp.focus();                             // mantém o foco para digitar o próximo (como no Planner)
+  const tmp = { id: 'tmp-' + (++ckTmp), texto, feito: false, ordem: 0, feitoPor: '', feitoEm: '' };
+  await ckMutate(() => S.ck.push(tmp), async () => {
+    const [saved] = await call('apiAddChecklistItems', S.ckTask, [texto]);
+    const i = S.ck.findIndex(x => x.id === tmp.id);
+    if (i >= 0) S.ck[i] = saved;
+    renderChecklist();
+  });
+}
+
+function onChecklistClick(e) {
+  const li = e.target.closest('.ck-item');
+  if (!li) return;
+  const item = S.ck.find(x => x.id === li.dataset.id);
+  if (!item) return;
+  if (item.id.startsWith('tmp-') && S.ckTask) return;   // ainda salvando
+
+  if (e.target.closest('.ck-check')) {
+    const feito = !item.feito;
+    ckMutate(() => Object.assign(item, { feito, feitoPor: feito ? S.boot.user.email : '', feitoEm: feito ? new Date().toISOString().slice(0, 19) : '' }),
+      async () => Object.assign(item, await call('apiUpdateChecklistItem', item.id, { feito })));
+  } else if (e.target.closest('.ck-del')) {
+    ckMutate(() => { S.ck = S.ck.filter(x => x.id !== item.id); },
+      () => call('apiDeleteChecklistItem', item.id));
+  } else if (e.target.closest('.ck-text') && !e.target.closest('input')) {
+    startCkEdit(li, item);
+  }
+}
+
+function startCkEdit(li, item) {
+  const span = li.querySelector('.ck-text');
+  li.draggable = false;
+  span.innerHTML = `<input maxlength="300" value="${esc(item.texto)}" aria-label="Editar item">`;
+  const inp = span.querySelector('input');
+  inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length);
+  let finished = false;
+  const finish = save => {
+    if (finished) return; finished = true;
+    const texto = inp.value.replace(/\s+/g, ' ').trim();
+    if (!save || !texto || texto === item.texto) return renderChecklist();
+    ckMutate(() => { item.texto = texto; },
+      async () => Object.assign(item, await call('apiUpdateChecklistItem', item.id, { texto })));
+  };
+  inp.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish(false); }
+  });
+  inp.addEventListener('blur', () => finish(true));
+}
+
+/* Reordenação: arrastar ou Alt+↑/↓ no item focado */
+function onChecklistKey(e) {
+  const li = e.target.closest('.ck-item');
+  if (!li || e.target.tagName === 'INPUT') return;
+  if (e.key === 'Enter' && e.target.classList.contains('ck-text')) { e.preventDefault(); return onChecklistClick({ target: e.target }); }
+  if (!e.altKey || !['ArrowUp', 'ArrowDown'].includes(e.key)) return;
+  e.preventDefault();
+  const i = S.ck.findIndex(x => x.id === li.dataset.id);
+  const j = e.key === 'ArrowUp' ? i - 1 : i + 1;
+  if (i < 0 || j < 0 || j >= S.ck.length) return;
+  moveCk(i, j);
+  setTimeout(() => { const el = $(`.ck-item[data-id="${CSS.escape(li.dataset.id)}"] .ck-text`); if (el) el.focus(); });
+}
+
+function onCkDragStart(e) {
+  const li = e.target.closest('.ck-item');
+  if (!li) return;
+  e.stopPropagation();
+  S.ckDrag = li.dataset.id;
+  li.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+  e.dataTransfer.setData('text/plain', 'ck:' + S.ckDrag);
+}
+function onCkDragOver(e) {
+  const li = e.target.closest('.ck-item');
+  if (!li || !S.ckDrag) return;
+  e.preventDefault();
+  const after = e.offsetY > li.offsetHeight / 2;
+  li.classList.toggle('drop-after', after);
+  li.classList.toggle('drop-before', !after);
+}
+function onCkDrop(e) {
+  const li = e.target.closest('.ck-item');
+  if (!li || !S.ckDrag) return;
+  e.preventDefault();
+  const from = S.ck.findIndex(x => x.id === S.ckDrag);
+  let to = S.ck.findIndex(x => x.id === li.dataset.id);
+  if (li.classList.contains('drop-after')) to++;
+  if (from < to) to--;
+  S.ckDrag = null;
+  if (from >= 0 && to >= 0 && from !== to) moveCk(from, to);
+  else renderChecklist();
+}
+function moveCk(from, to) {
+  ckMutate(() => { const [it] = S.ck.splice(from, 1); S.ck.splice(to, 0, it); },
+    async () => {
+      const ids = S.ck.map(x => x.id).filter(id => !id.startsWith('tmp-'));
+      S.ck = await call('apiReorderChecklist', S.ckTask, ids);
+      renderChecklist();
+    });
+}
+
+// Inicia só depois de todo o script avaliado (sem TDZ em const/let)
+init();
+</script>
