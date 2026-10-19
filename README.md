@@ -68,7 +68,8 @@ Web App (HtmlService) com Google Sheets como datastore: quadro Kanban drag & dro
    - **Config**: `categorias`, `lembreteDiasPadrao`, `horaLembrete`, `emailGestor` (CSV), `resumoSemanalGestor`, `notificarAtribuicao`, `urlPortal`.
 5. **Implantar → Nova implantação → App da Web** — *Executar como: Eu*; *Quem tem acesso: qualquer pessoa no domínio*. Copie a URL `/exec` para `Config.urlPortal` (link usado nos e-mails).
 6. Mudou `horaLembrete`? Rode `reinstallTriggers()`.
-7. Embed no Google Sites: *Inserir → Incorporar → URL* com a `/exec` (`XFrameOptionsMode.ALLOWALL` já habilitado).
+7. Ícone da aba (opcional): suba um PNG quadrado (64×64) no Drive, compartilhe como "Qualquer pessoa com o link" e cole em `Config.faviconUrl` a URL `https://drive.google.com/thumbnail?id=ID_DO_ARQUIVO&sz=w64`. Publique uma Nova versão. (O Web App roda num iframe sandbox; `<link rel="icon">` no HTML não funciona — só `setFaviconUrl`.)
+8. Embed no Google Sites: *Inserir → Incorporar → URL* com a `/exec` (`XFrameOptionsMode.ALLOWALL` já habilitado).
 
 
 ## Decisões de arquitetura

@@ -43,7 +43,8 @@ const DEFAULT_CFG = {
   resumoSemanalGestor: 'true',      // segunda-feira
   notificarAtribuicao: 'true',      // e-mail ao novo responsável
   notificarComentario: 'true',      // e-mail a responsável + criador em novo comentário (@menção notifica sempre)
-  urlPortal: ''                     // URL /exec do deployment (link nos e-mails)
+  urlPortal: '',                    // URL /exec do deployment (link nos e-mails)
+  faviconUrl: ''                    // URL pública de um PNG/ICO para o ícone da aba (vazio = ícone padrão do Apps Script)
 };
 
 let _ss, _team, _cfg; // memo por execução
@@ -159,9 +160,26 @@ function doGet(e) {
 }
 
 function frame_(out) {
+  applyFavicon_(out);
   return out.setTitle(APP.NAME)
     .addMetaTag('viewport', 'width=device-width, initial-scale=1')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL); // embed no Google Sites
+}
+
+/**
+ * Ícone da aba do navegador. O Web App roda num iframe sandbox, então <link rel="icon"> no HTML
+ * não tem efeito: a única via é HtmlOutput.setFaviconUrl(), que exige uma URL pública de imagem.
+ * Falha aqui nunca derruba o portal.
+ */
+function applyFavicon_(out) {
+  try {
+    let url = String(readCfg_().faviconUrl || '').trim();
+    if (!/^https:\/\//i.test(url)) return;
+    if (!/\.(png|ico|gif|jpe?g)(\?|#|$)/i.test(url)) url += '#.png'; // setFaviconUrl valida a extensão
+    out.setFaviconUrl(url);
+  } catch (e) {
+    console.warn('favicon ignorado: ' + e);
+  }
 }
 
 function simplePage_(msg) {
