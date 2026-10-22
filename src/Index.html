@@ -86,6 +86,15 @@
         <label>Responsável *<select name="responsavel" id="frmResp" required></select></label>
         <label>Categoria<select name="categoria" id="frmCat"></select></label>
         <label>Prioridade<select name="prioridade" id="frmPrio"></select></label>
+        <div class="full co-field">
+          <span class="co-label">Co-responsáveis</span>
+          <div class="co-box" id="coBox">
+            <div id="coChips" class="co-chips" aria-live="polite"></div>
+            <select id="coAdd" aria-label="Adicionar co-responsável"></select>
+          </div>
+          <input type="hidden" name="coResponsaveis" id="coValue">
+          <span class="hint">Todos os responsáveis veem a atividade em "Só minhas" e recebem lembretes e notificações.</span>
+        </div>
         <label>Status<select name="status" id="frmStatus"></select></label>
         <label>Início<input type="date" name="inicio"></label>
         <label>Prazo<input type="date" name="prazo"></label>

@@ -134,13 +134,13 @@ dialog::backdrop{background:rgba(15,23,42,.55)}
 }
 /* ── Modal com painel de comentários ── */
 dialog.with-comments{width:min(1120px,96vw)}
-.dlg-body{display:grid;grid-template-columns:minmax(0,1fr);max-height:calc(100vh - 170px)}
+.dlg-body{display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr);max-height:calc(100vh - 170px);overflow:hidden}
 dialog.with-comments .dlg-body{grid-template-columns:minmax(0,1fr) 380px}
 .dlg-body > form{overflow:auto;min-height:0}
-.cmt-panel{display:flex;flex-direction:column;min-height:0;border-left:1px solid var(--line);background:var(--panel-2)}
+.cmt-panel{display:flex;flex-direction:column;min-height:0;overflow:hidden;border-left:1px solid var(--line);background:var(--panel-2)}
 .cmt-panel h3{margin:0;padding:14px 16px 8px;font-size:13px;display:flex;align-items:center;gap:8px}
 .cmt-panel h3 .count{font-size:11px;color:var(--muted);background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:0 7px}
-.cmt-list{flex:1;min-height:180px;overflow:auto;padding:4px 16px 10px;display:flex;flex-direction:column;gap:12px}
+.cmt-list{flex:1;min-height:60px;overflow:auto;padding:4px 16px 10px;display:flex;flex-direction:column;gap:12px}
 .cmt{display:flex;gap:8px}
 .cmt .avatar{width:28px;height:28px;font-size:11px;margin-top:2px}
 .cmt.mine .avatar{background:var(--good)}
@@ -170,7 +170,8 @@ dialog.with-comments .dlg-body{grid-template-columns:minmax(0,1fr) 380px}
 .cmt-count svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:2;stroke-linejoin:round}
 .cmt-count + .due{margin-left:8px}
 @media (max-width:760px){
-  dialog.with-comments .dlg-body{grid-template-columns:1fr;overflow:auto}
+  dialog.with-comments .dlg-body{grid-template-columns:1fr;grid-template-rows:auto;overflow:auto}
+  .cmt-panel{overflow:visible}
   .dlg-body > form{overflow:visible}
   .cmt-panel{border-left:0;border-top:1px solid var(--line)}
   .cmt-actions{opacity:1}
@@ -302,4 +303,22 @@ dialog.adm{width:min(1000px,96vw)}
 .rm-box > div{display:flex;flex-direction:column;gap:2px;flex:1 1 260px}
 .rm-reassign{display:flex;align-items:center;gap:8px;font-size:13px}
 .rm-actions{margin-left:auto;display:flex;gap:8px}
+/* ── Co-responsáveis ── */
+.co-field{display:flex;flex-direction:column;gap:4px}
+.co-label{font-size:12px;color:var(--muted);font-weight:600}
+.co-box{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:6px 8px;min-height:40px;border:1px solid var(--line);border-radius:8px;background:var(--panel-2)}
+.co-chips{display:contents}
+.co-chip{display:inline-flex;align-items:center;gap:6px;padding:2px 4px 2px 3px;border-radius:999px;background:var(--panel);border:1px solid var(--line);font-size:13px;color:var(--ink);font-weight:500}
+.co-chip .avatar{width:20px;height:20px;font-size:9px}
+.co-chip button{border:0;background:transparent;color:var(--muted);cursor:pointer;font-size:11px;padding:2px 5px;border-radius:999px;line-height:1}
+.co-chip button:hover{color:var(--bad);background:var(--panel-2)}
+.co-empty{font-size:12px;color:var(--muted);font-weight:400;padding:0 4px}
+.co-box select{border:0!important;background:transparent!important;padding:4px 2px!important;color:var(--accent)!important;font-weight:600!important;cursor:pointer;margin-left:auto;font-size:13px}
+.co-box select:disabled{color:var(--muted)!important;cursor:default}
+.avatars{display:inline-flex;align-items:center;flex:none}
+.avatars .avatar{box-shadow:0 0 0 2px var(--panel)}
+.avatars .avatar + .avatar{margin-left:-4px}
+.avatar.co{background:#0d9488}
+.avatar.more{background:var(--muted);font-size:9px}
+.who-more{color:var(--muted);font-weight:700;font-size:11px}
 </style>

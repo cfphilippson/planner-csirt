@@ -21,7 +21,7 @@ window.addEventListener('unhandledrejection', e => console.warn('Promise rejeita
 const PRIO_RANK = { 'Crítica': 0, 'Alta': 1, 'Média': 2, 'Baixa': 3 };
 const STATUS_COLOR = { 'Backlog': '#94a3b8', 'A Fazer': '#60a5fa', 'Em Andamento': '#f59e0b', 'Bloqueado': '#ef4444', 'Concluído': '#22c55e' };
 const S = { boot: null, tasks: [], charts: {}, view: 'board', dragId: null, busy: false, tt: null,
-            cmtTask: null, comments: null, cmtBusy: false, drafts: {}, mention: null,
+            co: [], cmtTask: null, comments: null, cmtBusy: false, drafts: {}, mention: null,
             ckTask: null, ck: [], ckBusy: false, ckDrag: null };
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -37,6 +37,9 @@ const fmtBR = day => day ? day.split('-').reverse().slice(0, 2).join('/') : '';
 const fmtTs = iso => iso ? `${iso.slice(8, 10)}/${iso.slice(5, 7)}/${iso.slice(0, 4)} ${iso.slice(11, 16)}` : '—';
 
 const isDone = t => t.status === S.boot.done;
+const coOf = t => String(t.coResponsaveis || '').toLowerCase().split(/[;,\s]+/).filter(Boolean);
+/** Todos os responsáveis (principal primeiro, sem duplicar). */
+const respsOf = t => [...new Set([t.responsavel, ...coOf(t)].filter(Boolean))];
 const isLate = t => !isDone(t) && t.prazo && daysTo(t.prazo) < 0;
 const nameOf = email => (S.boot.team.find(m => m.email === email) || {}).nome || (email || '—').split('@')[0];
 const initials = n => n.split(/[\s._-]+/).filter(Boolean).slice(0, 2).map(p => p[0].toUpperCase()).join('');
@@ -159,6 +162,18 @@ function setupUI() {
   $('#dlg').addEventListener('click', e => { if (e.target.id === 'dlg') $('#dlg').close(); });
   $('#taskForm').addEventListener('submit', saveForm);
   $('#btnArchive').addEventListener('click', archiveCurrent);
+  $('#coAdd').addEventListener('change', e => {
+    const v = e.target.value; if (!v) return;
+    if (!S.co.includes(v)) S.co.push(v);
+    renderCo(); $('#coAdd').focus();
+  });
+  $('#coChips').addEventListener('click', e => {
+    const b = e.target.closest('[data-rm-co]'); if (!b) return;
+    S.co = S.co.filter(x => x !== b.dataset.rmCo); renderCo(); $('#coAdd').focus();
+  });
+  $('#frmResp').addEventListener('change', () => {           // principal não pode estar também como co
+    S.co = S.co.filter(x => x !== $('#frmResp').value); renderCo();
+  });
   $('#btnReminders').addEventListener('click', runReminders);
 
   // Comentários
@@ -244,8 +259,8 @@ function filtered() {
   const mine = $('#fMine').checked, late = $('#fLate').checked;
   return S.tasks.filter(t =>
     (!q || [t.id, t.titulo, t.tags, t.descricao].join(' ').toLowerCase().includes(q)) &&
-    (!r || t.responsavel === r) && (!c || t.categoria === c) && (!p || t.prioridade === p) &&
-    (!mine || t.responsavel === S.boot.user.email) && (!late || isLate(t)));
+    (!r || respsOf(t).includes(r)) && (!c || t.categoria === c) && (!p || t.prioridade === p) &&
+    (!mine || respsOf(t).includes(S.boot.user.email)) && (!late || isLate(t)));
 }
 
 function render() {
@@ -337,6 +352,9 @@ function cardHtml(t) {
     else due = fmtBR(t.prazo);
   }
   const nm = nameOf(t.responsavel);
+  const all = respsOf(t), extra = all.length - 1;
+  const avatars = all.slice(0, 3).map((e, i) => `<span class="avatar${i ? ' co' : ''}" title="${esc(nameOf(e))} · ${esc(e)}${i ? ' (co-responsável)' : ''}">${esc(initials(nameOf(e)))}</span>`).join('')
+    + (all.length > 3 ? `<span class="avatar more" title="${esc(all.slice(3).map(nameOf).join(', '))}">+${all.length - 3}</span>` : '');
   const rank = PRIO_RANK[t.prioridade] ?? 2;
   const tags = (t.tags || '').split(',').map(s => s.trim()).filter(Boolean).slice(0, 3)
     .map(x => `<span class="tag">#${esc(x)}</span>`).join('');
@@ -345,8 +363,8 @@ function cardHtml(t) {
     <h4>${esc(t.titulo)}</h4>
     ${t.categoria || tags ? `<div class="meta">${t.categoria ? `<span class="cat">${esc(t.categoria)}</span>` : ''}${tags}</div>` : ''}
     <footer class="card-foot">
-      <span class="avatar" title="${esc(nm)} · ${esc(t.responsavel)}">${esc(initials(nm))}</span>
-      <span class="who">${esc(nm)}</span>
+      <span class="avatars" title="${esc(all.map(nameOf).join(', '))}">${avatars}</span>
+      ${extra ? '<span class="who"></span>' : `<span class="who">${esc(nm)}</span>`}
       ${t.ckTotal ? `<span class="ck-badge${t.ckDone === t.ckTotal ? ' ok' : ''}" title="Lista de verificação: ${t.ckDone} de ${t.ckTotal}"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M8 12l3 3 5-6"/></svg>${t.ckDone}/${t.ckTotal}</span>` : ''}
       ${t.nComentarios ? `<span class="cmt-count" title="${t.nComentarios} comentário(s)"><svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.4A8 8 0 1 1 21 12z"/></svg>${t.nComentarios}</span>` : ''}
       ${due ? `<span class="due ${cls}">${esc(due)}</span>` : ''}
@@ -389,10 +407,10 @@ function renderDash(list) {
     options: { cutout: '62%', plugins: { legend: { position: 'right' } } }
   });
 
-  const people = [...new Set(list.map(t => t.responsavel))].sort((a, b) => nameOf(a).localeCompare(nameOf(b)));
+  const people = [...new Set(list.flatMap(respsOf))].sort((a, b) => nameOf(a).localeCompare(nameOf(b)));
   draw('chResp', {
     type: 'bar',
-    data: { labels: people.map(nameOf), datasets: st.map(s => ({ label: s, backgroundColor: STATUS_COLOR[s], data: people.map(p => list.filter(t => t.responsavel === p && t.status === s).length) })) },
+    data: { labels: people.map(nameOf), datasets: st.map(s => ({ label: s, backgroundColor: STATUS_COLOR[s], data: people.map(p => list.filter(t => respsOf(t).includes(p) && t.status === s).length) })) },
     options: { indexAxis: 'y', scales: { x: { stacked: true, ticks: { precision: 0 } }, y: { stacked: true } }, plugins: { legend: { position: 'bottom', labels: { boxWidth: 10 } } } }
   });
 
@@ -422,7 +440,7 @@ function renderDash(list) {
   });
 
   $('#respProgress').innerHTML = people.map(p => {
-    const g = list.filter(t => t.responsavel === p), d = g.filter(isDone).length;
+    const g = list.filter(t => respsOf(t).includes(p)), d = g.filter(isDone).length;
     const pc = Math.round(d * 100 / g.length), late = g.filter(isLate).length;
     return `<div class="rp"><div class="rp-head"><span>${esc(nameOf(p))}</span>
       <span>${pc}% · ${d}/${g.length}${late ? ` · <b class="late">${late} atrasada(s)</b>` : ''}</span></div>
@@ -458,11 +476,13 @@ function openTask(id) {
   f.reset();
   const v = t || { status: 'A Fazer', prioridade: 'Média', responsavel: S.boot.user.email, categoria: '', lembreteDias: '' };
   ensureOption($('#frmResp'), v.responsavel, nameOf(v.responsavel) + ' (inativo)');
+  S.co = t ? coOf(t) : [];
   ensureOption($('#frmCat'), v.categoria);
   f.elements.taskId.value = t ? t.id : '';
   f.elements.versao.value = t ? t.versao : '';
   ['titulo', 'descricao', 'responsavel', 'categoria', 'prioridade', 'status', 'inicio', 'prazo', 'lembreteDias', 'tags']
     .forEach(k => { f.elements[k].value = v[k] ?? ''; });
+  renderCo();
   $('#dlgTitle').textContent = t ? `Editar ${t.id}` : 'Nova atividade';
   $('#lembreteHint').textContent = `Vazio = padrão (${S.boot.lembreteDiasPadrao}d antes do prazo)`;
   $('#btnArchive').classList.toggle('hidden', !t || !(S.boot.user.papel === 'admin' || t.criadoPor === S.boot.user.email));
@@ -655,6 +675,19 @@ function onComposerKey(e) {
     if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); return hideMentions(); }
   }
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); postComment(); }
+}
+
+/* Co-responsáveis: chips + seletor (só membros ativos, sem o principal) */
+function renderCo() {
+  const prim = $('#frmResp').value;
+  S.co = (S.co || []).filter(e => e && e !== prim);
+  $('#coChips').innerHTML = S.co.map(e => `<span class="co-chip"><span class="avatar">${esc(initials(nameOf(e)))}</span>${esc(nameOf(e))}
+      <button type="button" data-rm-co="${esc(e)}" aria-label="Remover ${esc(nameOf(e))}" title="Remover">✕</button></span>`).join('')
+    || '<span class="co-empty">Nenhum — só o responsável principal</span>';
+  const opts = S.boot.team.filter(m => m.email !== prim && !S.co.includes(m.email)).sort((a, b) => a.nome.localeCompare(b.nome));
+  $('#coAdd').innerHTML = `<option value="">+ Adicionar…</option>` + opts.map(m => `<option value="${esc(m.email)}">${esc(m.nome)}</option>`).join('');
+  $('#coAdd').disabled = !opts.length || S.co.length >= 10;
+  $('#coValue').value = S.co.join(';');
 }
 
 async function saveForm(e) {
@@ -857,7 +890,7 @@ async function onMemberClick(e) {
     $$('#pane-mem tr.rm-row').forEach(x => x.remove());
     const tr = b.closest('tr');
     const email = tr.dataset.email, nome = tr.dataset.nome;
-    const open = S.tasks.filter(t => t.responsavel === email && t.status !== S.boot.done).length;
+    const open = S.tasks.filter(t => respsOf(t).includes(email) && t.status !== S.boot.done).length;
     const others = S.boot.team.filter(m => m.email !== email);
     tr.insertAdjacentHTML('afterend', `<tr class="rm-row" data-email="${esc(email)}" data-nome="${esc(nome)}"><td colspan="5">
       <div class="rm-box">
@@ -1065,8 +1098,9 @@ function buildRows() {
       else if (I.bucketMode === 'tag') tags.push(bucket);
     }
     let desc = String(r.descricao ?? '').trim();
-    const extra = assignees.slice(1).map(n => I.people[n] ? nameOf(I.people[n]) : n);
-    if (extra.length) desc += (desc ? '\n\n' : '') + 'Também atribuído a: ' + extra.join(', ');
+    const coResp = [...new Set(assignees.slice(1).map(n => I.people[n]).filter(Boolean))].filter(e => e !== resp);
+    const semMembro = assignees.slice(1).filter(n => !I.people[n]);
+    if (semMembro.length) desc += (desc ? '\n\n' : '') + 'Também atribuído no Planner a: ' + semMembro.join(', ');
     if (assignees[0] && !I.people[assignees[0]]) desc += (desc ? '\n' : '') + `Atribuído no Planner a: ${assignees[0]}`;
     // Itens da lista: o export traz os nomes (separados por ;) e só o total concluído (ex.: 1/3).
     const ckNames = String(r.ck ?? '').split(';').map(x => x.trim()).filter(Boolean);
@@ -1087,6 +1121,7 @@ function buildRows() {
       titulo: String(r.titulo).trim().slice(0, 200),
       descricao: desc.slice(0, 5000),
       responsavel: resp,
+      coResponsaveis: coResp.join(';'),
       categoria: categoria.slice(0, 80),
       prioridade: prioFrom(r.prioridade),
       status,
@@ -1135,7 +1170,7 @@ function renderImport() {
 
     <h3>Prévia (${Math.min(rows.length, 50)} de ${rows.length})</h3>
     <div class="imp-preview"><table class="tbl"><thead><tr><th>Linha</th><th>Título</th><th>Responsável</th><th>Status</th><th>Prioridade</th><th>Prazo</th><th>Checklist</th><th>Categoria / Tags</th></tr></thead><tbody>${
-      rows.slice(0, 50).map(r => `<tr><td class="muted">${r._linha}</td><td>${esc(r.titulo)}</td><td>${esc(nameOf(r.responsavel))}</td>
+      rows.slice(0, 50).map(r => `<tr><td class="muted">${r._linha}</td><td>${esc(r.titulo)}</td><td>${esc([r.responsavel, ...(r.coResponsaveis ? r.coResponsaveis.split(';') : [])].map(nameOf).join(', '))}</td>
         <td>${esc(r.status)}</td><td>${esc(r.prioridade)}</td><td>${esc(fmtBR(r.prazo)) || '—'}${r.prazo ? '/' + r.prazo.slice(2, 4) : ''}</td>
         <td>${r.checklist.length ? `${r.checklist.filter(x => x.feito).length}/${r.checklist.length}` : '—'}</td>
         <td>${esc([r.categoria, r.tags].filter(Boolean).join(' · '))}</td></tr>`).join('')}</tbody></table></div>

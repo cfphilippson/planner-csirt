@@ -29,11 +29,17 @@ const APP = {
 
 const COLS = ['id', 'titulo', 'descricao', 'responsavel', 'categoria', 'prioridade', 'status',
   'inicio', 'prazo', 'lembreteDias', 'tags', 'criadoPor', 'criadoEm', 'atualizadoEm',
-  'concluidoEm', 'ultimoLembrete', 'versao', 'arquivado', 'origemId'];
+  'concluidoEm', 'ultimoLembrete', 'versao', 'arquivado', 'origemId', 'coResponsaveis'];
 const C = Object.fromEntries(COLS.map((k, i) => [k, i]));
 const DAY_COLS = ['inicio', 'prazo'];
 const TS_COLS = ['criadoEm', 'atualizadoEm', 'concluidoEm', 'ultimoLembrete'];
-const TEXT_COLS = ['id', 'titulo', 'descricao', 'responsavel', 'categoria', 'prioridade', 'status', 'tags', 'criadoPor', 'origemId'];
+const TEXT_COLS = ['id', 'titulo', 'descricao', 'responsavel', 'categoria', 'prioridade', 'status', 'tags', 'criadoPor', 'origemId', 'coResponsaveis'];
+const MAX_CO = 10;
+
+/** Co-responsáveis: e-mails separados por ';' na coluna coResponsaveis. */
+const parseCo_ = v => [...new Set(String(v == null ? '' : v).toLowerCase().split(/[;,\s]+/).map(x => x.trim()).filter(Boolean))];
+/** Todos os responsáveis da atividade (principal + co), sem duplicar. */
+const allResp_ = t => [...new Set([String(t.responsavel || '').toLowerCase(), ...parseCo_(t.coResponsaveis)].filter(Boolean))];
 
 const DEFAULT_CFG = {
   categorias: 'CSIRT, Engenharia de Detecção, SOC, Projetos, Melhoria Contínua',
@@ -385,14 +391,17 @@ function apiSaveTask(input) {
 
   const res = withLock_(() => {
     const sh = sheet_(APP.SH_TASKS);
+    ensureTaskHeader_(sh);
     const now = new Date();
     let task, before = null;
+    const normCo = t => { t.coResponsaveis = parseCo_(t.coResponsaveis).filter(e => e !== t.responsavel).join(';'); return t; };
 
     if (isCreate) {
       task = Object.assign(Object.fromEntries(COLS.map(k => [k, ''])), clean, {
         id: newId_(), criadoPor: user.email, criadoEm: now, atualizadoEm: now, versao: 1, arquivado: false
       });
       if (task.status === APP.DONE) task.concluidoEm = now;
+      normCo(task);
       sh.appendRow(taskToRow_(task, true));
       log_(user.email, 'CREATE', task.id, task.titulo);
     } else {
@@ -400,7 +409,7 @@ function apiSaveTask(input) {
       before = found.task;
       if (before.arquivado) throw new Error('Atividade arquivada.');
       assertVersion_(before, input.versao);
-      task = Object.assign({}, before, clean, { atualizadoEm: now, versao: before.versao + 1 });
+      task = normCo(Object.assign({}, before, clean, { atualizadoEm: now, versao: before.versao + 1 }));
       if (task.status === APP.DONE && before.status !== APP.DONE) task.concluidoEm = now;
       if (task.status !== APP.DONE) task.concluidoEm = '';
       sh.getRange(found.rowIdx, 1, 1, COLS.length).setValues([taskToRow_(task, true)]);
@@ -459,6 +468,14 @@ function validate_(i, isCreate) {
     o.responsavel = str(i.responsavel, 254).toLowerCase();
     if (!getTeam_().some(t => t.ativo && t.email === o.responsavel)) throw new Error('Responsável inválido ou inativo.');
   }
+  if (has('coResponsaveis')) {
+    const list = Array.isArray(i.coResponsaveis) ? parseCo_(i.coResponsaveis.join(';')) : parseCo_(i.coResponsaveis);
+    if (list.length > MAX_CO) throw new Error(`Máximo de ${MAX_CO} co-responsáveis.`);
+    const ativos = new Set(getTeam_().filter(t => t.ativo).map(t => t.email));
+    const bad = list.filter(e => !ativos.has(e));
+    if (bad.length) throw new Error('Co-responsável inválido ou inativo: ' + bad.join(', '));
+    o.coResponsaveis = list.join(';');
+  }
   if (has('categoria')) o.categoria = str(i.categoria, 80);
   if (has('prioridade') || isCreate) o.prioridade = APP.PRIORITIES.includes(i.prioridade) ? i.prioridade : 'Média';
   if (has('status') || isCreate) {
@@ -481,7 +498,7 @@ function validate_(i, isCreate) {
 }
 
 function diff_(a, b) {
-  return ['titulo', 'responsavel', 'categoria', 'prioridade', 'status', 'inicio', 'prazo', 'lembreteDias', 'tags', 'descricao']
+  return ['titulo', 'responsavel', 'coResponsaveis', 'categoria', 'prioridade', 'status', 'inicio', 'prazo', 'lembreteDias', 'tags', 'descricao']
     .filter(k => String(a[k] == null ? '' : a[k]) !== String(b[k] == null ? '' : b[k]))
     .map(k => k === 'descricao' ? 'descricao alterada' : `${k}: ${a[k]} → ${b[k]}`)
     .join('; ');
@@ -630,7 +647,7 @@ function notifyComment_(task, c, actor) {
     const cfg = readCfg_();
     const mentioned = mentionsIn_(c.texto);
     const to = new Set(mentioned);
-    if (cfg.notificarComentario !== 'false') [task.responsavel, task.criadoPor].forEach(e => e && to.add(e));
+    if (cfg.notificarComentario !== 'false') [...allResp_(task), task.criadoPor].forEach(e => e && to.add(e));
     to.delete(actor.email);
     const active = new Set(getTeam_().filter(m => m.ativo).map(m => m.email));
     const url = portalUrl_();
@@ -653,11 +670,15 @@ function notify_(before, t, actor) {
   try {
     const cfg = readCfg_();
     const url = portalUrl_();
-    const reassigned = !before || before.responsavel !== t.responsavel;
-    if (cfg.notificarAtribuicao === 'true' && reassigned && t.responsavel && t.responsavel !== actor.email) {
-      sendMail_(t.responsavel, `[${APP.NAME}] Atividade atribuída: ${t.titulo}`,
-        `<p><b>${esc_(actor.nome)}</b> atribuiu a você a atividade abaixo.</p>` + tasksTable_([t], false) +
-        (t.descricao ? `<p style="white-space:pre-wrap;color:#334155">${esc_(t.descricao)}</p>` : ''), url);
+    const antes = new Set(before ? allResp_(before) : []);
+    const novos = allResp_(t).filter(e => !antes.has(e) && e !== actor.email);
+    if (cfg.notificarAtribuicao === 'true') {
+      novos.forEach(e => {
+        const papel = e === t.responsavel ? 'responsável' : 'co-responsável';
+        sendMail_(e, `[${APP.NAME}] Atividade atribuída: ${t.titulo}`,
+          `<p><b>${esc_(actor.nome)}</b> incluiu você como <b>${papel}</b> na atividade abaixo.</p>` + tasksTable_([t], false) +
+          (t.descricao ? `<p style="white-space:pre-wrap;color:#334155">${esc_(t.descricao)}</p>` : ''), url);
+      });
     }
     if (cfg.emailGestor && t.status === APP.BLOCKED && (!before || before.status !== APP.BLOCKED)) {
       sendMail_(cfg.emailGestor, `[${APP.NAME}] Atividade BLOQUEADA: ${t.titulo}`,
@@ -696,7 +717,7 @@ function runReminders_() {
     if (!sit && t.status === APP.BLOCKED) sit = { tipo: 'bloqueada', ord: 2, txt: 'Bloqueada' };
     if (!sit) return;
     t._sit = sit;
-    (byUser[t.responsavel] = byUser[t.responsavel] || []).push(t);
+    allResp_(t).forEach(e => (byUser[e] = byUser[e] || []).push(t));
   });
 
   const url = portalUrl_();
@@ -754,11 +775,13 @@ function sendManagerDigest_(all, url) {
 
   const people = {};
   all.forEach(t => {
-    const p = people[t.responsavel] = people[t.responsavel] || { total: 0, done: 0, open: 0, late: 0, done7: 0 };
-    p.total++;
-    if (isDone(t)) p.done++; else p.open++;
-    if (isLate(t)) p.late++;
-    if (done7.includes(t)) p.done7++;
+    allResp_(t).forEach(e => {
+      const p = people[e] = people[e] || { total: 0, done: 0, open: 0, late: 0, done7: 0 };
+      p.total++;
+      if (isDone(t)) p.done++; else p.open++;
+      if (isLate(t)) p.late++;
+      if (done7.includes(t)) p.done7++;
+    });
   });
   const th = s => `<th style="text-align:left;padding:6px 8px;border-bottom:2px solid #e5e7eb;font-size:12px;color:#475569">${s}</th>`;
   const td = s => `<td style="padding:6px 8px;border-bottom:1px solid #f1f5f9">${s}</td>`;
@@ -767,7 +790,7 @@ function sendManagerDigest_(all, url) {
       `<tr>${td(esc_(name(e)))}${td(p.open)}${td(p.late ? `<b style="color:#dc2626">${p.late}</b>` : 0)}${td(p.done7)}${td(Math.round(p.done * 100 / p.total) + '%')}</tr>`).join('') +
     '</table>';
 
-  late.forEach(t => { t._sit = { tipo: 'atrasada', txt: `Atrasada ${-daysBetween_(today, t.prazo)}d — ${name(t.responsavel)}` }; });
+  late.forEach(t => { t._sit = { tipo: 'atrasada', txt: `Atrasada ${-daysBetween_(today, t.prazo)}d — ${allResp_(t).map(name).join(', ')}` }; });
 
   const html = `<p>Resumo semanal do time.</p>
     <table style="border-collapse:separate;border-spacing:8px"><tr>
@@ -1043,8 +1066,13 @@ function apiRemoveMember(email, reassignTo) {
     if (reassignTo) {
       const sh = sheet_(APP.SH_TASKS);
       const now = new Date();
-      readTasks_().filter(t => t.responsavel === email && t.status !== APP.DONE).forEach(t => {
-        sh.getRange(t._row, C.responsavel + 1).setValue("'" + reassignTo);
+      readTasks_().filter(t => allResp_(t).includes(email) && t.status !== APP.DONE).forEach(t => {
+        let prim = t.responsavel, co = parseCo_(t.coResponsaveis);
+        if (prim === email) prim = reassignTo;
+        else co = co.map(e => e === email ? reassignTo : e);
+        co = [...new Set(co)].filter(e => e !== prim);
+        sh.getRange(t._row, C.responsavel + 1).setValue("'" + prim);
+        sh.getRange(t._row, C.coResponsaveis + 1).setValue(co.length ? "'" + co.join(';') : '');
         sh.getRange(t._row, C.atualizadoEm + 1).setValue(now);
         sh.getRange(t._row, C.versao + 1).setValue(t.versao + 1); // quem estiver com o form aberto recebe CONFLITO
         reatribuidas++;
@@ -1083,6 +1111,7 @@ function ensureTaskHeader_(sh) {
   const n = COLS.length;
   if (sh.getMaxColumns() < n) sh.insertColumnsAfter(sh.getMaxColumns(), n - sh.getMaxColumns());
   const hdr = sh.getRange(1, 1, 1, n).getValues()[0];
+  COLS.forEach((c, i) => { if (i < n - 1 && hdr[i] !== c && !hdr[i]) sh.getRange(1, i + 1).setValue(c).setFontWeight('bold'); });
   if (hdr[n - 1] !== COLS[n - 1]) sh.getRange(1, n).setValue(COLS[n - 1]).setFontWeight('bold');
 }
 
@@ -1109,7 +1138,7 @@ function apiImportTasks(rows) {
         const origemId = String(r.origemId || '').trim().slice(0, 120);
         if (origemId && seen.has(origemId)) { res.duplicadas++; return; }
         const input = {};
-        ['titulo', 'descricao', 'responsavel', 'categoria', 'prioridade', 'status', 'inicio', 'prazo', 'tags']
+        ['titulo', 'descricao', 'responsavel', 'coResponsaveis', 'categoria', 'prioridade', 'status', 'inicio', 'prazo', 'tags']
           .forEach(k => { if (r[k] != null) input[k] = r[k]; });
         if (input.inicio && input.prazo && input.inicio > input.prazo) delete input.inicio;
         const clean = validate_(input, true);
@@ -1119,6 +1148,7 @@ function apiImportTasks(rows) {
           id, criadoPor: team.has(String(r.criadoPor || '').toLowerCase()) ? String(r.criadoPor).toLowerCase() : user.email,
           criadoEm: created, atualizadoEm: now, versao: 1, arquivado: false, origemId
         });
+        t.coResponsaveis = parseCo_(t.coResponsaveis).filter(e => e !== t.responsavel).join(';');
         if (t.status === APP.DONE) {
           t.concluidoEm = /^\d{4}-\d{2}-\d{2}/.test(String(r.concluidoEm || '')) ? parseDate_(r.concluidoEm) : now;
         }

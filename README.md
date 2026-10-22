@@ -96,6 +96,13 @@ Web App (HtmlService) com Google Sheets como datastore: quadro Kanban drag & dro
 - **Segurança:** texto escapado antes de renderizar; links só `http/https` com `rel="noopener noreferrer"`; gravação com prefixo `'` (sem formula injection); limite de 5.000 caracteres; atividade arquivada bloqueia novos comentários.
 - UX: Ctrl+Enter envia; rascunho preservado por atividade ao fechar o modal; thread atualiza a cada 20 s enquanto o modal está aberto (sem atropelar edição em curso).
 
+## Co-responsáveis
+
+- Além do **responsável principal**, cada atividade aceita até 10 **co-responsáveis** (membros ativos), escolhidos por chips no formulário. Coluna `coResponsaveis` na aba Atividades (e-mails separados por `;`), criada automaticamente.
+- Todos os responsáveis contam igual em "Só minhas", no filtro por responsável, nos gráficos/percentuais por pessoa, no digest diário de lembretes, nas notificações de comentário e no resumo semanal ao gestor.
+- E-mail de atribuição vai só para quem **entrou** na atividade (principal ou co) — editar outros campos não reenvia. O principal nunca fica duplicado na lista de co.
+- Card mostra os avatares empilhados (até 3 + "+N"). Remover um membro com reatribuição substitui a pessoa também onde ela é co-responsável. A importação do MS Planner leva todos os atribuídos (1º = principal, demais = co).
+
 ## Colunas recolhíveis
 
 - Clique no cabeçalho de qualquer coluna (ou Enter/Espaço com foco) para recolher/expandir. Recolhida, a coluna mostra um resumo clicável — em Concluído, "› Tarefas concluídas · N", como no MS Planner.
