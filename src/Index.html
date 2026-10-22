@@ -51,6 +51,7 @@
     <select id="fResp"><option value="">Todos os responsáveis</option></select>
     <select id="fCat"><option value="">Todas as categorias</option></select>
     <select id="fPrio"><option value="">Todas as prioridades</option></select>
+    <select id="fTag"><option value="">Todas as tags</option></select>
     <label class="toggle"><input type="checkbox" id="fMine" checked> Só minhas</label>
     <label class="toggle"><input type="checkbox" id="fLate"> Só atrasadas</label>
     <nav class="tabs">
@@ -99,7 +100,18 @@
         <label>Início<input type="date" name="inicio"></label>
         <label>Prazo<input type="date" name="prazo"></label>
         <label>Lembrete (dias antes)<input type="number" name="lembreteDias" min="0" max="60"><span class="hint" id="lembreteHint"></span></label>
-        <label class="two">Tags (separadas por vírgula)<input name="tags" maxlength="300" placeholder="ex.: phishing, coleta, regra"></label>
+        <div class="two tag-field">
+          <span class="co-label">Tags</span>
+          <div class="tag-box" id="tagBox">
+            <div id="tagChips" class="co-chips" aria-live="polite"></div>
+            <button type="button" id="tagAddBtn" class="tag-add" aria-haspopup="true" aria-expanded="false">+ Tag</button>
+            <div id="tagPop" class="tag-pop hidden" role="dialog" aria-label="Escolher tags">
+              <input id="tagSearch" maxlength="30" placeholder="Buscar ou criar tag…" autocomplete="off" aria-label="Buscar ou criar tag">
+              <div id="tagList" class="tag-list"></div>
+            </div>
+          </div>
+          <input type="hidden" name="tags" id="tagValue">
+        </div>
 
         <div class="full ck" id="ckBox">
           <div class="ck-head">

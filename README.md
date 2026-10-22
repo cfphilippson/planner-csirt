@@ -96,6 +96,12 @@ Web App (HtmlService) com Google Sheets como datastore: quadro Kanban drag & dro
 - **Segurança:** texto escapado antes de renderizar; links só `http/https` com `rel="noopener noreferrer"`; gravação com prefixo `'` (sem formula injection); limite de 5.000 caracteres; atividade arquivada bloqueia novos comentários.
 - UX: Ctrl+Enter envia; rascunho preservado por atividade ao fechar o modal; thread atualiza a cada 20 s enquanto o modal está aberto (sem atropelar edição em curso).
 
+## Tags coloridas
+
+- Catálogo de tags na aba **Tags** (`nome | cor | criadoPor | criadoEm`), no estilo dos rótulos do MS Planner. No formulário, "+ Tag" abre um seletor com busca: clicar seleciona/desmarca; digitar um nome novo mostra a paleta para **criar a tag já com a cor**; 🎨 troca a cor de uma tag existente (vale para todas as atividades); 🗑 exclui (somente admin — remove a tag de todas as atividades, com auditoria).
+- Paleta fixa de 12 cores, todas com contraste AA (≥ 4,5:1) com texto branco nos temas claro e escuro; o servidor só aceita cores da paleta (sem injeção de CSS).
+- Atividades guardam os nomes na coluna `tags`; nomes são normalizados (sem `#`, sem duplicata ignorando acento/caixa, grafia do catálogo), máximo de 10 por atividade. Tags digitadas/importadas que não existem entram no catálogo com cor automática. Filtro "Todas as tags" no quadro. Auditoria: `TAG_CREATE/COLOR/DELETE`.
+
 ## Co-responsáveis
 
 - Além do **responsável principal**, cada atividade aceita até 10 **co-responsáveis** (membros ativos), escolhidos por chips no formulário. Coluna `coResponsaveis` na aba Atividades (e-mails separados por `;`), criada automaticamente.

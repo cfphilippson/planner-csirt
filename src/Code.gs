@@ -5,6 +5,7 @@
  * Superfície exposta ao cliente (google.script.run): apiBootstrap, apiListTasks,
  * apiSaveTask, apiArchiveTask, apiRunRemindersNow, apiSetTheme,
  * apiListComments, apiAddComment, apiEditComment, apiDeleteComment, apiRemoveMember,
+ * apiListTags, apiSaveTag, apiDeleteTag,
  * apiListChecklist, apiAddChecklistItems, apiUpdateChecklistItem, apiDeleteChecklistItem, apiReorderChecklist.
  * Entradas de operação: setup() (editor), runReminders() (trigger diário).
  * Tudo com sufixo "_" é privado (não invocável via google.script.run).
@@ -20,6 +21,7 @@ const APP = {
   SH_COMMENTS: 'Comentarios',
   SH_REQ: 'Solicitacoes',
   SH_CHECK: 'Checklist',
+  SH_TAGS: 'Tags',
   STATUSES: ['Backlog', 'A Fazer', 'Em Andamento', 'Bloqueado', 'Concluído'],
   DONE: 'Concluído',
   BLOCKED: 'Bloqueado',
@@ -74,6 +76,7 @@ function setup() {
   ensureTaskHeader_(tasks);
   ensureSheet_(ss, APP.SH_REQ, RCOLS);
   ensureSheet_(ss, APP.SH_CHECK, KCOLS);
+  ensureSheet_(ss, APP.SH_TAGS, TCOLS);
   const rows = Math.max(tasks.getMaxRows() - 1, 1);
   DAY_COLS.forEach(k => tasks.getRange(2, C[k] + 1, rows, 1).setNumberFormat('yyyy-mm-dd'));
   TS_COLS.forEach(k => tasks.getRange(2, C[k] + 1, rows, 1).setNumberFormat('yyyy-mm-dd hh:mm:ss'));
@@ -99,6 +102,7 @@ function setup() {
     if (s && ss.getSheets().length > 1) ss.deleteSheet(s);
   });
 
+  try { ensureTags_(readTasks_(true).map(t => t.tags).join(','), Session.getEffectiveUser().getEmail().toLowerCase()); } catch (e) { console.warn('seed de tags: ' + e); }
   _cfg = null;
   installTriggers_(Number(readCfg_().horaLembrete) || 8);
   console.log('DB: ' + ss.getUrl());
@@ -373,6 +377,8 @@ function apiBootstrap() {
     priorities: APP.PRIORITIES,
     categorias: String(cfg.categorias || '').split(',').map(s => s.trim()).filter(Boolean),
     lembreteDiasPadrao: Number(cfg.lembreteDiasPadrao) || 2,
+    tags: tagsForClient_(),
+    tagPalette: TAG_PALETTE,
     pendingAccess: user.papel === 'admin' ? readRequests_().filter(r => r.status === 'pendente').length : 0,
     tasks: withCounts_(readTasks_())
   };
@@ -402,6 +408,7 @@ function apiSaveTask(input) {
       });
       if (task.status === APP.DONE) task.concluidoEm = now;
       normCo(task);
+      ensureTags_(task.tags, user.email);
       sh.appendRow(taskToRow_(task, true));
       log_(user.email, 'CREATE', task.id, task.titulo);
     } else {
@@ -410,6 +417,7 @@ function apiSaveTask(input) {
       if (before.arquivado) throw new Error('Atividade arquivada.');
       assertVersion_(before, input.versao);
       task = normCo(Object.assign({}, before, clean, { atualizadoEm: now, versao: before.versao + 1 }));
+      if ('tags' in clean) ensureTags_(task.tags, user.email);
       if (task.status === APP.DONE && before.status !== APP.DONE) task.concluidoEm = now;
       if (task.status !== APP.DONE) task.concluidoEm = '';
       sh.getRange(found.rowIdx, 1, 1, COLS.length).setValues([taskToRow_(task, true)]);
@@ -492,7 +500,7 @@ function validate_(i, isCreate) {
     o.lembreteDias = (i.lembreteDias === '' || i.lembreteDias == null)
       ? '' : Math.max(0, Math.min(60, parseInt(i.lembreteDias, 10) || 0));
   }
-  if (has('tags')) o.tags = str(i.tags, 300);
+  if (has('tags')) o.tags = normTags_(i.tags);
   if (o.inicio && o.prazo && o.inicio > o.prazo) throw new Error('Início posterior ao prazo.');
   return o;
 }
@@ -1132,6 +1140,7 @@ function apiImportTasks(rows) {
     const out = [];
     const res = { inseridas: 0, duplicadas: 0, erros: [] };
     const ckRows = [];
+    const impTags = [];
 
     rows.forEach((r, i) => {
       try {
@@ -1149,6 +1158,7 @@ function apiImportTasks(rows) {
           criadoEm: created, atualizadoEm: now, versao: 1, arquivado: false, origemId
         });
         t.coResponsaveis = parseCo_(t.coResponsaveis).filter(e => e !== t.responsavel).join(';');
+        impTags.push(t.tags);
         if (t.status === APP.DONE) {
           t.concluidoEm = /^\d{4}-\d{2}-\d{2}/.test(String(r.concluidoEm || '')) ? parseDate_(r.concluidoEm) : now;
         }
@@ -1170,6 +1180,7 @@ function apiImportTasks(rows) {
     });
 
     if (out.length) sh.getRange(sh.getLastRow() + 1, 1, out.length, COLS.length).setValues(out);
+    res.tagsCriadas = ensureTags_(impTags.join(','), user.email);
     if (ckRows.length) {
       const ks = ckSheet_();
       ks.getRange(ks.getLastRow() + 1, 1, ckRows.length, KCOLS.length).setValues(ckRows);
@@ -1192,7 +1203,7 @@ function diagnostico() {
   };
   step('Propriedade PLANNER_SSID', () => PropertiesService.getScriptProperties().getProperty(APP.PROP_SSID) || (() => { throw new Error('ausente — rode setup()'); })());
   step('Abrir planilha', () => ss_().getName());
-  [APP.SH_TASKS, APP.SH_TEAM, APP.SH_CFG, APP.SH_LOG, APP.SH_COMMENTS, APP.SH_REQ, APP.SH_CHECK].forEach(n =>
+  [APP.SH_TASKS, APP.SH_TEAM, APP.SH_CFG, APP.SH_LOG, APP.SH_COMMENTS, APP.SH_REQ, APP.SH_CHECK, APP.SH_TAGS].forEach(n =>
     step(`Aba ${n}`, () => { const sh = sheet_(n); if (!sh) throw new Error('não existe — rode setup()'); return `${sh.getLastRow()} linhas × ${sh.getMaxColumns()} colunas`; }));
   step('Cabeçalho Atividades', () => {
     const h = sheet_(APP.SH_TASKS).getRange(1, 1, 1, COLS.length).getValues()[0];
@@ -1362,4 +1373,106 @@ function apiReorderChecklist(taskId, ids) {
     log_(user.email, 'CHECK_REORDER', task.id, `${order.length} itens`);
     return apiListChecklist(task.id);
   });
+}
+
+
+/* ─────────────────────────── Tags (catálogo com cores) ─────────────────────────── */
+// Aba Tags: nome | cor | criadoPor | criadoEm. As atividades continuam guardando os NOMES na coluna
+// "tags" (separados por vírgula); a cor vem do catálogo. Cor só da paleta (evita injeção de CSS) e
+// toda paleta tem contraste AA com texto branco nos dois temas.
+
+const TCOLS = ['nome', 'cor', 'criadoPor', 'criadoEm'];
+const TAG_PALETTE = ['#B91C1C', '#C2410C', '#A16207', '#4D7C0F', '#15803D', '#0F766E',
+  '#0369A1', '#1D4ED8', '#6D28D9', '#A21CAF', '#BE185D', '#475569'];
+const MAX_TAGS = 10, MAX_TAG_LEN = 30;
+
+function tagsSheet_() { return sheet_(APP.SH_TAGS) || ensureSheet_(ss_(), APP.SH_TAGS, TCOLS); }
+const tagKey_ = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
+const cleanTagName_ = s => String(s || '').replace(/\s+/g, ' ').replace(/^#+/, '').trim().slice(0, MAX_TAG_LEN);
+const splitTags_ = v => String(v || '').split(/[,;]/).map(cleanTagName_).filter(Boolean);
+
+function defaultTagColor_(name) {
+  let h = 0; for (const ch of tagKey_(name)) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return TAG_PALETTE[h % TAG_PALETTE.length];
+}
+
+function readTags_() {
+  const sh = sheet_(APP.SH_TAGS);
+  if (!sh || sh.getLastRow() < 2) return [];
+  return sh.getRange(2, 1, sh.getLastRow() - 1, TCOLS.length).getValues()
+    .map((r, i) => ({ nome: cleanTagName_(r[0]), cor: String(r[1]).toUpperCase(), _row: i + 2 }))
+    .filter(t => t.nome)
+    .map(t => Object.assign(t, { cor: TAG_PALETTE.includes(t.cor) ? t.cor : defaultTagColor_(t.nome) }));
+}
+const tagsForClient_ = () => readTags_().map(({ nome, cor }) => ({ nome, cor })).sort((a, b) => a.nome.localeCompare(b.nome));
+
+/** Normaliza a lista de tags de uma atividade: sem duplicatas (ignora acento/caixa), grafia do catálogo. */
+function normTags_(v) {
+  const cat = new Map(readTags_().map(t => [tagKey_(t.nome), t.nome]));
+  const out = [], seen = new Set();
+  splitTags_(v).forEach(n => { const k = tagKey_(n); if (!seen.has(k)) { seen.add(k); out.push(cat.get(k) || n); } });
+  if (out.length > MAX_TAGS) throw new Error(`Máximo de ${MAX_TAGS} tags por atividade.`);
+  return out.join(', ');
+}
+
+/** Cria no catálogo (cor automática) as tags ainda inexistentes. Chamar dentro do lock. */
+function ensureTags_(tagsStr, email) {
+  const cat = new Set(readTags_().map(t => tagKey_(t.nome)));
+  const rows = [], seen = new Set(), now = new Date();
+  splitTags_(tagsStr).forEach(n => {
+    const k = tagKey_(n);
+    if (cat.has(k) || seen.has(k)) return;
+    seen.add(k);
+    rows.push(["'" + n, defaultTagColor_(n), "'" + (email || ''), now]);
+  });
+  if (rows.length) { const sh = tagsSheet_(); sh.getRange(sh.getLastRow() + 1, 1, rows.length, TCOLS.length).setValues(rows); }
+  return rows.length;
+}
+
+function apiListTags() { currentUser_(); return tagsForClient_(); }
+
+/** Cria a tag ou troca a cor de uma existente (qualquer membro ativo). */
+function apiSaveTag(nome, cor) {
+  const user = currentUser_();
+  nome = cleanTagName_(nome);
+  cor = String(cor || '').toUpperCase();
+  if (!nome) throw new Error('Informe o nome da tag.');
+  if (!TAG_PALETTE.includes(cor)) throw new Error('Cor inválida.');
+  withLock_(() => {
+    const t = readTags_().find(x => tagKey_(x.nome) === tagKey_(nome));
+    if (t) {
+      if (t.cor === cor) return;
+      tagsSheet_().getRange(t._row, 2).setValue(cor);
+      log_(user.email, 'TAG_COLOR', '', `${t.nome}: ${t.cor} → ${cor}`);
+    } else {
+      tagsSheet_().appendRow(["'" + nome, cor, "'" + user.email, new Date()]);
+      log_(user.email, 'TAG_CREATE', '', `${nome} ${cor}`);
+    }
+  });
+  return tagsForClient_();
+}
+
+/** Exclui a tag do catálogo e de todas as atividades (somente admin). */
+function apiDeleteTag(nome) {
+  const user = currentUser_();
+  assertAdmin_(user);
+  const k = tagKey_(nome);
+  let removidas = 0;
+  withLock_(() => {
+    const t = readTags_().find(x => tagKey_(x.nome) === k);
+    if (!t) throw new Error('Tag não encontrada.');
+    const sh = sheet_(APP.SH_TASKS), now = new Date();
+    readTasks_(true).forEach(task => {
+      const list = splitTags_(task.tags);
+      const nova = list.filter(n => tagKey_(n) !== k);
+      if (nova.length === list.length) return;
+      sh.getRange(task._row, C.tags + 1).setValue(nova.length ? "'" + nova.join(', ') : '');
+      sh.getRange(task._row, C.atualizadoEm + 1).setValue(now);
+      sh.getRange(task._row, C.versao + 1).setValue(task.versao + 1);
+      removidas++;
+    });
+    tagsSheet_().deleteRow(t._row);
+    log_(user.email, 'TAG_DELETE', '', `${t.nome} (removida de ${removidas} atividade(s))`);
+  });
+  return { removidas, tags: tagsForClient_() };
 }

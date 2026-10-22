@@ -21,7 +21,7 @@ window.addEventListener('unhandledrejection', e => console.warn('Promise rejeita
 const PRIO_RANK = { 'Crítica': 0, 'Alta': 1, 'Média': 2, 'Baixa': 3 };
 const STATUS_COLOR = { 'Backlog': '#94a3b8', 'A Fazer': '#60a5fa', 'Em Andamento': '#f59e0b', 'Bloqueado': '#ef4444', 'Concluído': '#22c55e' };
 const S = { boot: null, tasks: [], charts: {}, view: 'board', dragId: null, busy: false, tt: null,
-            co: [], cmtTask: null, comments: null, cmtBusy: false, drafts: {}, mention: null,
+            co: [], tagSel: [], tagEdit: null, newTagColor: null, cmtTask: null, comments: null, cmtBusy: false, drafts: {}, mention: null,
             ckTask: null, ck: [], ckBusy: false, ckDrag: null };
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -39,6 +39,11 @@ const fmtTs = iso => iso ? `${iso.slice(8, 10)}/${iso.slice(5, 7)}/${iso.slice(0
 const isDone = t => t.status === S.boot.done;
 const coOf = t => String(t.coResponsaveis || '').toLowerCase().split(/[;,\s]+/).filter(Boolean);
 /** Todos os responsáveis (principal primeiro, sem duplicar). */
+/* Tags: cor vem do catálogo (S.boot.tags); só hex da paleta é aceito */
+const tagKey = s => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+const splitTags = v => String(v || '').split(/[,;]/).map(x => x.replace(/\s+/g, ' ').replace(/^#+/, '').trim()).filter(Boolean);
+const tagColor = n => { const t = (S.boot.tags || []).find(x => tagKey(x.nome) === tagKey(n)); const c = t ? t.cor : '#475569'; return /^#[0-9A-F]{6}$/i.test(c) ? c : '#475569'; };
+const tagPill = n => `<span class="tag" style="--tc:${tagColor(n)}">${esc(n)}</span>`;
 const respsOf = t => [...new Set([t.responsavel, ...coOf(t)].filter(Boolean))];
 const isLate = t => !isDone(t) && t.prazo && daysTo(t.prazo) < 0;
 const nameOf = email => (S.boot.team.find(m => m.email === email) || {}).nome || (email || '—').split('@')[0];
@@ -142,11 +147,12 @@ function setupUI() {
   fillTeam();
   fillSelect($('#fCat'), b.categorias.map(c => [c, c]));
   fillSelect($('#fPrio'), b.priorities.map(p => [p, p]));
+  fillTagFilter();
   fillSelect($('#frmCat'), [['', '—'], ...b.categorias.map(c => [c, c])], { keepFirst: false });
   fillSelect($('#frmPrio'), b.priorities.map(p => [p, p]), { keepFirst: false });
   fillSelect($('#frmStatus'), b.statuses.map(s => [s, s]), { keepFirst: false });
 
-  ['#fSearch', '#fResp', '#fCat', '#fPrio', '#fMine', '#fLate'].forEach(id =>
+  ['#fSearch', '#fResp', '#fCat', '#fPrio', '#fTag', '#fMine', '#fLate'].forEach(id =>
     $(id).addEventListener(id === '#fSearch' ? 'input' : 'change', render));
 
   $$('.tab').forEach(t => t.addEventListener('click', () => {
@@ -162,6 +168,18 @@ function setupUI() {
   $('#dlg').addEventListener('click', e => { if (e.target.id === 'dlg') $('#dlg').close(); });
   $('#taskForm').addEventListener('submit', saveForm);
   $('#btnArchive').addEventListener('click', archiveCurrent);
+  // Tags
+  $('#tagAddBtn').addEventListener('click', () => $('#tagPop').classList.contains('hidden') ? openTagPop() : closeTagPop());
+  $('#tagSearch').addEventListener('input', renderTagPop);
+  $('#tagSearch').addEventListener('keydown', onTagSearchKey);
+  $('#tagList').addEventListener('click', onTagListClick);
+  $('#tagChips').addEventListener('click', e => {
+    const b = e.target.closest('[data-rm-tag]'); if (!b) return;
+    S.tagSel = S.tagSel.filter(n => tagKey(n) !== tagKey(b.dataset.rmTag)); renderTagChips();
+  });
+  document.addEventListener('mousedown', e => {
+    if (!$('#tagPop').classList.contains('hidden') && !e.target.closest('#tagBox')) closeTagPop();
+  });
   $('#coAdd').addEventListener('change', e => {
     const v = e.target.value; if (!v) return;
     if (!S.co.includes(v)) S.co.push(v);
@@ -203,7 +221,8 @@ function setupUI() {
   $('#dlg').addEventListener('close', () => { S.cmtTask = null; S.comments = null; hideMentions(); });
   // Esc com menu de menção aberto fecha só o menu, não o modal
   $('#dlg').addEventListener('cancel', e => {
-    if ($('.ck-text input')) { e.preventDefault(); renderChecklist(); }
+    if (!$('#tagPop').classList.contains('hidden')) { e.preventDefault(); closeTagPop(); $('#tagAddBtn').focus(); }
+    else if ($('.ck-text input')) { e.preventDefault(); renderChecklist(); }
     else if (S.mention) { e.preventDefault(); hideMentions(); }
     else if ($('.cmt-edit')) { e.preventDefault(); renderComments(false); }
   });
@@ -255,12 +274,13 @@ function setupUI() {
 /* ───────────── render ───────────── */
 function filtered() {
   const q = $('#fSearch').value.trim().toLowerCase();
-  const r = $('#fResp').value, c = $('#fCat').value, p = $('#fPrio').value;
+  const r = $('#fResp').value, c = $('#fCat').value, p = $('#fPrio').value, tg = tagKey($('#fTag').value);
   const mine = $('#fMine').checked, late = $('#fLate').checked;
   return S.tasks.filter(t =>
     (!q || [t.id, t.titulo, t.tags, t.descricao].join(' ').toLowerCase().includes(q)) &&
     (!r || respsOf(t).includes(r)) && (!c || t.categoria === c) && (!p || t.prioridade === p) &&
-    (!mine || respsOf(t).includes(S.boot.user.email)) && (!late || isLate(t)));
+    (!mine || respsOf(t).includes(S.boot.user.email)) && (!late || isLate(t)) &&
+    (!tg || splitTags(t.tags).some(n => tagKey(n) === tg)));
 }
 
 function render() {
@@ -356,8 +376,8 @@ function cardHtml(t) {
   const avatars = all.slice(0, 3).map((e, i) => `<span class="avatar${i ? ' co' : ''}" title="${esc(nameOf(e))} · ${esc(e)}${i ? ' (co-responsável)' : ''}">${esc(initials(nameOf(e)))}</span>`).join('')
     + (all.length > 3 ? `<span class="avatar more" title="${esc(all.slice(3).map(nameOf).join(', '))}">+${all.length - 3}</span>` : '');
   const rank = PRIO_RANK[t.prioridade] ?? 2;
-  const tags = (t.tags || '').split(',').map(s => s.trim()).filter(Boolean).slice(0, 3)
-    .map(x => `<span class="tag">#${esc(x)}</span>`).join('');
+  const tl = splitTags(t.tags);
+  const tags = tl.slice(0, 3).map(tagPill).join('') + (tl.length > 3 ? `<span class="tag more" title="${esc(tl.slice(3).join(', '))}">+${tl.length - 3}</span>` : '');
   return `<article class="card" draggable="true" data-id="${esc(t.id)}" data-prio="${rank}">
     <div class="card-top"><span class="badge prio-${rank}">${esc(t.prioridade)}</span><span class="cid">${esc(t.id)}</span></div>
     <h4>${esc(t.titulo)}</h4>
@@ -480,9 +500,10 @@ function openTask(id) {
   ensureOption($('#frmCat'), v.categoria);
   f.elements.taskId.value = t ? t.id : '';
   f.elements.versao.value = t ? t.versao : '';
-  ['titulo', 'descricao', 'responsavel', 'categoria', 'prioridade', 'status', 'inicio', 'prazo', 'lembreteDias', 'tags']
+  ['titulo', 'descricao', 'responsavel', 'categoria', 'prioridade', 'status', 'inicio', 'prazo', 'lembreteDias']
     .forEach(k => { f.elements[k].value = v[k] ?? ''; });
   renderCo();
+  S.tagSel = splitTags(v.tags); closeTagPop(); renderTagChips();
   $('#dlgTitle').textContent = t ? `Editar ${t.id}` : 'Nova atividade';
   $('#lembreteHint').textContent = `Vazio = padrão (${S.boot.lembreteDiasPadrao}d antes do prazo)`;
   $('#btnArchive').classList.toggle('hidden', !t || !(S.boot.user.papel === 'admin' || t.criadoPor === S.boot.user.email));
@@ -677,6 +698,101 @@ function onComposerKey(e) {
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); postComment(); }
 }
 
+/* ───────────── Tags (catálogo com cores, estilo rótulos do MS Planner) ───────────── */
+function fillTagFilter() {
+  const sel = $('#fTag'), cur = sel.value;
+  fillSelect(sel, (S.boot.tags || []).map(t => [t.nome, t.nome]));
+  if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+}
+function renderTagChips() {
+  $('#tagChips').innerHTML = (S.tagSel || []).map(n => `<span class="tag tag-chip" style="--tc:${tagColor(n)}">${esc(n)}
+      <button type="button" data-rm-tag="${esc(n)}" aria-label="Remover tag ${esc(n)}" title="Remover">✕</button></span>`).join('')
+    || '<span class="co-empty">Sem tags</span>';
+  $('#tagValue').value = (S.tagSel || []).join(', ');
+  $('#tagAddBtn').disabled = (S.tagSel || []).length >= 10;
+}
+function openTagPop() {
+  S.tagEdit = null; S.newTagColor = null;
+  $('#tagPop').classList.remove('hidden'); $('#tagAddBtn').setAttribute('aria-expanded', 'true');
+  $('#tagSearch').value = ''; renderTagPop(); $('#tagSearch').focus();
+}
+function closeTagPop() {
+  $('#tagPop').classList.add('hidden'); $('#tagAddBtn').setAttribute('aria-expanded', 'false'); S.tagEdit = null;
+}
+const swatches = (sel, act, extra = '') => (S.boot.tagPalette || []).map(c =>
+  `<button type="button" class="sw${c === sel ? ' on' : ''}" style="background:${c}" data-act="${act}" data-cor="${c}" ${extra} aria-label="Cor ${c}" title="${c}"></button>`).join('');
+
+function renderTagPop() {
+  const q = $('#tagSearch').value.replace(/\s+/g, ' ').replace(/^#+/, '').trim().slice(0, 30);
+  const k = tagKey(q), selKeys = new Set((S.tagSel || []).map(tagKey));
+  const list = (S.boot.tags || []).filter(t => !k || tagKey(t.nome).includes(k));
+  const admin = S.boot.user.papel === 'admin';
+  let html = list.map(t => {
+    const on = selKeys.has(tagKey(t.nome)), editing = S.tagEdit && tagKey(S.tagEdit) === tagKey(t.nome);
+    return `<div class="tag-row${on ? ' on' : ''}" data-tag="${esc(t.nome)}">
+        <button type="button" class="tag-pick" data-act="toggle" role="menuitemcheckbox" aria-checked="${on}">
+          <span class="tick" aria-hidden="true">${on ? '✓' : ''}</span>${tagPill(t.nome)}</button>
+        <button type="button" class="tag-ico" data-act="edit" title="Mudar cor" aria-label="Mudar cor de ${esc(t.nome)}">🎨</button>
+        ${admin ? `<button type="button" class="tag-ico del" data-act="del" title="Excluir tag (admin)" aria-label="Excluir tag ${esc(t.nome)}">🗑</button>` : ''}
+      </div>${editing ? `<div class="sw-row" data-tag="${esc(t.nome)}">${swatches(t.cor, 'recolor')}</div>` : ''}`;
+  }).join('');
+  const exists = (S.boot.tags || []).some(t => tagKey(t.nome) === k);
+  if (q && !exists) {
+    const pal = S.boot.tagPalette || [];
+    if (!S.newTagColor) { let h = 0; for (const ch of k) h = (h * 31 + ch.charCodeAt(0)) >>> 0; S.newTagColor = pal[h % pal.length]; }
+    html += `<div class="tag-new">
+        <div class="tag-new-head">Criar ${`<span class="tag" style="--tc:${S.newTagColor}">${esc(q)}</span>`}</div>
+        <div class="sw-row">${swatches(S.newTagColor, 'pickNew')}</div>
+        <button type="button" class="btn primary sm" data-act="create" data-nome="${esc(q)}">Criar e adicionar</button>
+      </div>`;
+  }
+  $('#tagList').innerHTML = html || '<p class="co-empty">Nenhuma tag. Digite um nome para criar.</p>';
+}
+
+function toggleTag(nome) {
+  const k = tagKey(nome);
+  if (S.tagSel.some(n => tagKey(n) === k)) S.tagSel = S.tagSel.filter(n => tagKey(n) !== k);
+  else { if (S.tagSel.length >= 10) return toast('Máximo de 10 tags por atividade.', 'err'); S.tagSel.push(nome); }
+  renderTagChips(); renderTagPop();
+}
+
+async function onTagListClick(e) {
+  const b = e.target.closest('button[data-act]'); if (!b) return;
+  const act = b.dataset.act, row = b.closest('[data-tag]'), nome = row ? row.dataset.tag : b.dataset.nome;
+  if (act === 'toggle') return toggleTag(nome);
+  if (act === 'edit') { S.tagEdit = S.tagEdit && tagKey(S.tagEdit) === tagKey(nome) ? null : nome; return renderTagPop(); }
+  if (act === 'pickNew') { S.newTagColor = b.dataset.cor; return renderTagPop(); }
+  try {
+    if (act === 'recolor') {
+      S.boot.tags = await call('apiSaveTag', nome, b.dataset.cor);
+      S.tagEdit = null; toast(`Cor da tag "${nome}" atualizada`);
+    } else if (act === 'create') {
+      S.boot.tags = await call('apiSaveTag', nome, S.newTagColor);
+      const t = S.boot.tags.find(x => tagKey(x.nome) === tagKey(nome));
+      if (t && !S.tagSel.some(n => tagKey(n) === tagKey(t.nome))) S.tagSel.push(t.nome);
+      $('#tagSearch').value = ''; S.newTagColor = null; toast(`Tag "${nome}" criada`);
+    } else if (act === 'del') {
+      if (!confirm(`Excluir a tag "${nome}"? Ela será removida de todas as atividades.`)) return;
+      const r = await call('apiDeleteTag', nome);
+      S.boot.tags = r.tags; S.tagSel = S.tagSel.filter(n => tagKey(n) !== tagKey(nome));
+      toast(`Tag "${nome}" excluída · removida de ${r.removidas} atividade(s)`); refresh(true);
+    }
+    fillTagFilter(); renderTagChips(); renderTagPop(); render();
+  } catch (err) { handleErr(err); }
+}
+
+function onTagSearchKey(e) {
+  if (e.key !== 'Enter') return;
+  e.preventDefault();                                   // não submete o formulário
+  const q = $('#tagSearch').value.trim(); if (!q) return;
+  const all = S.boot.tags || [];
+  const hit = all.find(t => tagKey(t.nome) === tagKey(q));
+  const parciais = all.filter(t => tagKey(t.nome).includes(tagKey(q)));
+  const alvo = hit || (parciais.length === 1 ? parciais[0] : null);   // 1 sugestão → seleciona, não cria
+  if (alvo) { toggleTag(alvo.nome); $('#tagSearch').value = ''; renderTagPop(); }
+  else if (!parciais.length) { const c = $('#tagList [data-act="create"]'); if (c) c.click(); }
+}
+
 /* Co-responsáveis: chips + seletor (só membros ativos, sem o principal) */
 function renderCo() {
   const prim = $('#frmResp').value;
@@ -736,7 +852,10 @@ async function runReminders() {
 
 async function refresh(force) {
   if (!force && (S.dragId || $('#dlg').open || document.hidden || S.busy)) return;
-  try { S.tasks = await call('apiListTasks'); render(); } catch (e) { console.warn(e); }
+  try {
+    const [tasks, tags] = await Promise.all([call('apiListTasks'), call('apiListTags')]);
+    S.tasks = tasks; S.boot.tags = tags; fillTagFilter(); render();
+  } catch (e) { console.warn(e); }
 }
 
 function setBusy(b) { S.busy = b; $('#btnSave').disabled = b; $('#btnArchive').disabled = b; }
@@ -1190,6 +1309,7 @@ function resultHtml(r) {
       <div class="kpi"><span>${r.duplicadas}</span><small>já existiam (ignoradas)</small></div>
       <div class="kpi ${r.erros.length ? 'bad' : ''}"><span>${r.erros.length}</span><small>com erro</small></div>
       <div class="kpi"><span>${r.itensChecklist || 0}</span><small>itens de checklist</small></div>
+      <div class="kpi"><span>${r.tagsCriadas || 0}</span><small>tags novas</small></div>
     </div>
     ${r.erros.length ? `<table class="tbl"><thead><tr><th>Linha</th><th>Título</th><th>Erro</th></tr></thead><tbody>${
       r.erros.map(e => `<tr><td>${esc(e.linha)}</td><td>${esc(e.titulo || '')}</td><td class="imp-err">${esc(e.erro)}</td></tr>`).join('')}</tbody></table>` : ''}`;
@@ -1224,6 +1344,7 @@ async function onImportClick(e) {
       const r = await call('apiImportTasks', rows.slice(i, i + BATCH));
       tot.inseridas += r.inseridas; tot.duplicadas += r.duplicadas; tot.erros.push(...r.erros);
       tot.itensChecklist = (tot.itensChecklist || 0) + (r.itensChecklist || 0);
+      tot.tagsCriadas = (tot.tagsCriadas || 0) + (r.tagsCriadas || 0);
     } catch (err) {
       tot.erros.push({ linha: `lote ${i / BATCH + 1}`, erro: errText(err) });
     }
